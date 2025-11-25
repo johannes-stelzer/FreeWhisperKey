@@ -1,0 +1,57 @@
+# macOS cruft
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+
+# Editor / tooling noise
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.netrc
+.env
+.env.*
+
+# SwiftPM / Xcode build outputs
+/.build
+/.swiftpm
+/Packages
+DerivedData/
+xcuserdata/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+*.xcodeproj/project.xcworkspace/xcuserdata
+*.dSYM
+*.playground/
+
+# Distribution artifacts
+dist/
+*.xcarchive
+*.ipa
+*.pkg
+*.dmg
+
+# Native / CMake builds (whisper.cpp and friends)
+build/
+whisper.cpp/build*/
+whisper.cpp/bin/
+whisper.cpp/out/
+CMakeFiles/
+CMakeCache.txt
+cmake-build-*/
+**/*.o
+**/*.a
+**/*.lo
+**/*.la
+**/*.so
+**/*.dylib
+**/*.dll
+**/*.exe
+**/*.obj
+**/*.pch
