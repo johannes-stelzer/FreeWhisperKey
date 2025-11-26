@@ -4,13 +4,13 @@ import Foundation
 import TranscriptionCore
 import UniformTypeIdentifiers
 
-@MainActor private let accessibilityPromptOptionKey = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
-
 final class AppSettings {
     private enum Keys {
         static let autoPasteEnabled = "autoPasteEnabled"
         static let selectedModelFilename = "selectedModelFilename"
         static let customModelPath = "customModelPath"
+        static let prependSpaceBeforePaste = "prependSpaceBeforePaste"
+        static let insertNewlineOnBreak = "insertNewlineOnBreak"
     }
 
     private let defaults = UserDefaults.standard
@@ -41,6 +41,23 @@ final class AppSettings {
                 defaults.removeObject(forKey: Keys.customModelPath)
             }
         }
+    }
+
+    var prependSpaceBeforePaste: Bool {
+        get {
+            if defaults.object(forKey: Keys.prependSpaceBeforePaste) == nil {
+                return true
+            }
+            return defaults.bool(forKey: Keys.prependSpaceBeforePaste)
+        }
+        set {
+            defaults.set(newValue, forKey: Keys.prependSpaceBeforePaste)
+        }
+    }
+
+    var insertNewlineOnBreak: Bool {
+        get { defaults.bool(forKey: Keys.insertNewlineOnBreak) }
+        set { defaults.set(newValue, forKey: Keys.insertNewlineOnBreak) }
     }
 }
 
@@ -159,7 +176,9 @@ final class PreferencesWindowController: NSWindowController {
 
     private var modelOptions: [ModelOption] = []
 
-    private let checkbox = NSButton(checkboxWithTitle: "Automatically paste transcript at cursor", target: nil, action: nil)
+    private let checkbox = NSButton(checkboxWithTitle: "Automatically paste transcript", target: nil, action: nil)
+    private let prependSpaceCheckbox = NSButton(checkboxWithTitle: "Add a leading space before the pasted text", target: nil, action: nil)
+    private let newlineOnBreakCheckbox = NSButton(checkboxWithTitle: "Start on a new line after a long pause", target: nil, action: nil)
     private let modelPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let modelPathField = NSTextField(labelWithString: "")
     private let downloadButton = NSButton(title: "Download Selected Model", target: nil, action: nil)
@@ -185,6 +204,14 @@ final class PreferencesWindowController: NSWindowController {
         checkbox.target = self
         checkbox.action = #selector(toggleAutoPaste)
         checkbox.state = settings.autoPasteEnabled ? .on : .off
+
+        prependSpaceCheckbox.target = self
+        prependSpaceCheckbox.action = #selector(togglePrependSpace)
+        prependSpaceCheckbox.state = settings.prependSpaceBeforePaste ? .on : .off
+
+        newlineOnBreakCheckbox.target = self
+        newlineOnBreakCheckbox.action = #selector(toggleNewlineOnBreak)
+        newlineOnBreakCheckbox.state = settings.insertNewlineOnBreak ? .on : .off
 
         modelPopup.target = self
         modelPopup.action = #selector(modelSelectionChanged)
@@ -212,7 +239,7 @@ final class PreferencesWindowController: NSWindowController {
         refreshModelOptions()
 
         let behaviorHeader = PreferencesWindowController.makeHeader("Behavior")
-        let behaviorDescription = PreferencesWindowController.makeSubtext("When disabled, FreeWhisperKey copies the result to the clipboard instead of pasting.")
+        let behaviorDescription = PreferencesWindowController.makeSubtext("When automatic pasting is off, FreeWhisperKey copies the transcript to the clipboard instead.")
 
         let modelHeader = PreferencesWindowController.makeHeader("Model")
         let modelDescription = PreferencesWindowController.makeSubtext("Select a bundled ggml model or provide your own file.")
@@ -244,6 +271,8 @@ final class PreferencesWindowController: NSWindowController {
             behaviorHeader,
             checkbox,
             behaviorDescription,
+            prependSpaceCheckbox,
+            newlineOnBreakCheckbox,
             PreferencesWindowController.makeDivider(),
             modelHeader,
             modelStack
@@ -253,6 +282,7 @@ final class PreferencesWindowController: NSWindowController {
         stack.spacing = 12
         stack.edgeInsets = NSEdgeInsets(top: 20, left: 24, bottom: 20, right: 24)
         window.contentView = stack
+        updateBehaviorControls()
     }
 
     required init?(coder: NSCoder) {
@@ -261,7 +291,25 @@ final class PreferencesWindowController: NSWindowController {
 
     @objc private func toggleAutoPaste() {
         settings.autoPasteEnabled = (checkbox.state == .on)
+        updateBehaviorControls()
         onChange()
+    }
+
+    @objc private func togglePrependSpace() {
+        settings.prependSpaceBeforePaste = (prependSpaceCheckbox.state == .on)
+        onChange()
+    }
+
+    @objc private func toggleNewlineOnBreak() {
+        settings.insertNewlineOnBreak = (newlineOnBreakCheckbox.state == .on)
+        onChange()
+    }
+
+    private func updateBehaviorControls() {
+        prependSpaceCheckbox.isEnabled = settings.autoPasteEnabled
+        prependSpaceCheckbox.alphaValue = settings.autoPasteEnabled ? 1 : 0.6
+        newlineOnBreakCheckbox.isEnabled = settings.autoPasteEnabled
+        newlineOnBreakCheckbox.alphaValue = settings.autoPasteEnabled ? 1 : 0.6
     }
 
     private func refreshModelOptions() {
@@ -690,338 +738,6 @@ final class FnHotkeyMonitor {
     }
 }
 
-final class TextCursorLocator {
-    private let systemWideElement = AXUIElementCreateSystemWide()
-    private var didRequestAuthorizationPrompt = false
-
-    @MainActor
-    func requestAccessibilityAuthorizationIfNeeded() {
-        guard !AXIsProcessTrusted(), !didRequestAuthorizationPrompt else { return }
-        didRequestAuthorizationPrompt = true
-        let options = [accessibilityPromptOptionKey: true] as CFDictionary
-        AXIsProcessTrustedWithOptions(options)
-    }
-
-    func currentCaretPoint() -> CGPoint? {
-        guard AXIsProcessTrusted() else { return nil }
-
-        var focusedElement: CFTypeRef?
-        let focusedResult = AXUIElementCopyAttributeValue(
-            systemWideElement,
-            kAXFocusedUIElementAttribute as CFString,
-            &focusedElement
-        )
-        guard focusedResult == .success,
-              let element = focusedElement,
-              CFGetTypeID(element) == AXUIElementGetTypeID() else {
-            return nil
-        }
-        let targetElement = element as! AXUIElement
-
-        var selectedRangeValue: CFTypeRef?
-        let rangeResult = AXUIElementCopyAttributeValue(
-            targetElement,
-            kAXSelectedTextRangeAttribute as CFString,
-            &selectedRangeValue
-        )
-        guard rangeResult == .success,
-              let rangeAX = selectedRangeValue,
-              CFGetTypeID(rangeAX) == AXValueGetTypeID() else {
-            return nil
-        }
-        let rangeValue = rangeAX as! AXValue
-
-        var range = CFRange(location: 0, length: 0)
-        guard AXValueGetType(rangeValue) == .cfRange,
-              AXValueGetValue(rangeValue, .cfRange, &range) else {
-            return nil
-        }
-
-        var insertionRange = CFRange(location: range.location + range.length, length: 0)
-        guard let insertionAX = AXValueCreate(.cfRange, &insertionRange) else {
-            return nil
-        }
-
-        var boundsValue: CFTypeRef?
-        let boundsResult = AXUIElementCopyParameterizedAttributeValue(
-            targetElement,
-            kAXBoundsForRangeParameterizedAttribute as CFString,
-            insertionAX,
-            &boundsValue
-        )
-        guard boundsResult == .success,
-              let boundsAX = boundsValue,
-              CFGetTypeID(boundsAX) == AXValueGetTypeID() else {
-            return nil
-        }
-        let boundsValueAX = boundsAX as! AXValue
-
-        var rect = CGRect.zero
-        guard AXValueGetType(boundsValueAX) == .cgRect,
-              AXValueGetValue(boundsValueAX, .cgRect, &rect) else {
-            return nil
-        }
-
-        return CGPoint(x: rect.midX, y: rect.midY)
-    }
-}
-
-@MainActor
-final class CursorLevelOverlay {
-    private let overlaySize = CGSize(width: 44, height: 44)
-    private let window: NSWindow
-    private let levelView: CursorLevelView
-    private var isVisible = false
-    private var latestLevel: CGFloat = 0
-    private var lastKnownPosition: CGPoint?
-    private var hasShownWindow = false
-
-    init() {
-        levelView = CursorLevelView(frame: NSRect(origin: .zero, size: overlaySize))
-        levelView.autoresizingMask = [.width, .height]
-
-        window = NSWindow(
-            contentRect: NSRect(origin: .zero, size: overlaySize),
-            styleMask: .borderless,
-            backing: .buffered,
-            defer: false
-        )
-        window.isOpaque = false
-        window.backgroundColor = .clear
-        window.hasShadow = false
-        window.ignoresMouseEvents = true
-        window.level = .screenSaver
-        window.collectionBehavior = [.canJoinAllSpaces, .ignoresCycle, .stationary]
-        window.contentView = levelView
-        window.alphaValue = 0
-    }
-
-    func show() {
-        guard !isVisible else { return }
-        isVisible = true
-        hasShownWindow = false
-        levelView.level = latestLevel
-        if lastKnownPosition != nil {
-            updatePosition()
-            revealWindowIfNeeded()
-        }
-    }
-
-    func hide() {
-        guard isVisible else { return }
-        isVisible = false
-        hasShownWindow = false
-        guard window.isVisible else {
-            levelView.level = 0
-            window.orderOut(nil)
-            return
-        }
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.2
-            window.animator().alphaValue = 0
-        } completionHandler: { [weak self] in
-            Task { @MainActor [weak self] in
-                self?.window.orderOut(nil)
-                self?.levelView.level = 0
-            }
-        }
-    }
-
-    func update(level: CGFloat, caretPoint: CGPoint?) {
-        latestLevel = max(0, min(1, level))
-        if let caretPoint {
-            lastKnownPosition = caretPoint
-        }
-        guard isVisible else { return }
-        levelView.level = latestLevel
-        if lastKnownPosition != nil {
-            updatePosition()
-            revealWindowIfNeeded()
-        }
-    }
-
-    func primeAnchor(with point: CGPoint?) {
-        lastKnownPosition = point
-        if isVisible, lastKnownPosition != nil {
-            updatePosition()
-            revealWindowIfNeeded()
-        }
-    }
-
-    private func updatePosition() {
-        guard let anchor = lastKnownPosition else { return }
-        let origin = NSPoint(
-            x: anchor.x - overlaySize.width / 2,
-            y: anchor.y - overlaySize.height / 2
-        )
-        window.setFrame(NSRect(origin: origin, size: overlaySize), display: false)
-    }
-
-    private func revealWindowIfNeeded() {
-        guard isVisible, !hasShownWindow else { return }
-        hasShownWindow = true
-        window.alphaValue = 0
-        window.orderFront(nil)
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.15
-            window.animator().alphaValue = 1
-        }
-    }
-}
-
-final class CursorLevelView: NSView {
-    var level: CGFloat = 0 {
-        didSet { targetLevel = max(0, min(1, level)) }
-    }
-
-    private var targetLevel: CGFloat = 0
-    private var displayLevel: CGFloat = 0
-    private var animationPhase: CGFloat = 0
-    private var animationTimer: DispatchSourceTimer?
-
-    override var isOpaque: Bool { false }
-
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        if window != nil {
-            startAnimation()
-        } else {
-            stopAnimation()
-        }
-    }
-
-    deinit {
-        animationTimer?.cancel()
-        animationTimer = nil
-    }
-
-    private func startAnimation() {
-        guard animationTimer == nil else { return }
-        let timer = DispatchSource.makeTimerSource(queue: .main)
-        timer.schedule(deadline: .now(), repeating: .milliseconds(16))
-        timer.setEventHandler { [weak self] in
-            guard let self else { return }
-            self.animationPhase = self.animationPhase.truncatingRemainder(dividingBy: .pi * 2) + 0.045
-            let easing: CGFloat = 0.18
-            self.displayLevel += (self.targetLevel - self.displayLevel) * easing
-            self.needsDisplay = true
-        }
-        animationTimer = timer
-        timer.resume()
-    }
-
-    private func stopAnimation() {
-        animationTimer?.cancel()
-        animationTimer = nil
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        NSColor.clear.setFill()
-        dirtyRect.fill()
-
-        let bounds = self.bounds
-        let center = CGPoint(x: bounds.midX, y: bounds.midY)
-        let maxRadius = min(bounds.width, bounds.height) / 2 - 1
-        let activeLevel = displayLevel
-        let pulse = 0.5 + 0.5 * sin(animationPhase * 2)
-
-        let outerRect = NSRect(
-            x: center.x - maxRadius,
-            y: center.y - maxRadius,
-            width: maxRadius * 2,
-            height: maxRadius * 2
-        )
-        let baseAlpha = 0.08 + 0.2 * (activeLevel + pulse * 0.3)
-        NSColor.white.withAlphaComponent(baseAlpha).setFill()
-        NSBezierPath(ovalIn: outerRect).fill()
-
-        let outerStroke = NSBezierPath(ovalIn: outerRect)
-        outerStroke.lineWidth = 1
-        NSColor.black.withAlphaComponent(0.45).setStroke()
-        outerStroke.stroke()
-
-        let arcRadius = maxRadius - 4
-        let startAngle = (animationPhase * 180 / .pi).truncatingRemainder(dividingBy: 360)
-        let sweep = (0.25 + 0.5 * activeLevel) * 320
-        let endAngle = startAngle + sweep
-        let arcWidth = 1.6 + activeLevel * 2.8
-
-        let leadArc = NSBezierPath()
-        leadArc.appendArc(withCenter: center, radius: arcRadius, startAngle: startAngle, endAngle: endAngle, clockwise: false)
-        leadArc.lineWidth = arcWidth
-        NSColor.white.withAlphaComponent(0.95).setStroke()
-        leadArc.stroke()
-
-        let shadowArc = NSBezierPath()
-        shadowArc.appendArc(withCenter: center, radius: arcRadius - 3, startAngle: startAngle - 10, endAngle: endAngle - 10, clockwise: false)
-        shadowArc.lineWidth = arcWidth * 0.7
-        NSColor.black.withAlphaComponent(0.4).setStroke()
-        shadowArc.stroke()
-
-        let dashArc = NSBezierPath()
-        dashArc.appendArc(withCenter: center, radius: arcRadius + 2, startAngle: startAngle + 6, endAngle: endAngle + 6, clockwise: false)
-        dashArc.setLineDash([3, 4], count: 2, phase: animationPhase * 12)
-        dashArc.lineWidth = 1
-        NSColor.white.withAlphaComponent(0.35).setStroke()
-        dashArc.stroke()
-
-        let accentAngle = endAngle * .pi / 180
-        let accentRadius = arcRadius
-        let accentCenter = CGPoint(
-            x: center.x + cos(accentAngle) * accentRadius,
-            y: center.y + sin(accentAngle) * accentRadius
-        )
-        let accentSize = 3 + activeLevel * 3.2
-        let accentRect = NSRect(
-            x: accentCenter.x - accentSize / 2,
-            y: accentCenter.y - accentSize / 2,
-            width: accentSize,
-            height: accentSize
-        )
-        NSColor.white.setFill()
-        NSBezierPath(ovalIn: accentRect).fill()
-        let accentStroke = NSBezierPath(ovalIn: accentRect)
-        accentStroke.lineWidth = 0.9
-        NSColor.black.withAlphaComponent(0.5).setStroke()
-        accentStroke.stroke()
-
-        let coreRadius = (maxRadius - 10) * (0.4 + 0.45 * activeLevel)
-        let coreRect = NSRect(
-            x: center.x - coreRadius,
-            y: center.y - coreRadius,
-            width: coreRadius * 2,
-            height: coreRadius * 2
-        )
-        NSColor.white.withAlphaComponent(0.2 + 0.3 * activeLevel).setFill()
-        NSBezierPath(ovalIn: coreRect).fill()
-        let coreStroke = NSBezierPath(ovalIn: coreRect)
-        coreStroke.lineWidth = 1
-        NSColor.black.withAlphaComponent(0.55).setStroke()
-        coreStroke.stroke()
-
-        let crossLength = coreRadius * 0.55
-        let crossPath = NSBezierPath()
-        crossPath.move(to: CGPoint(x: center.x - crossLength, y: center.y))
-        crossPath.line(to: CGPoint(x: center.x + crossLength, y: center.y))
-        crossPath.move(to: CGPoint(x: center.x, y: center.y - crossLength))
-        crossPath.line(to: CGPoint(x: center.x, y: center.y + crossLength))
-        crossPath.lineWidth = 0.7
-        NSColor.black.withAlphaComponent(0.35).setStroke()
-        crossPath.stroke()
-
-        let pulseRadius = coreRadius * (0.55 + 0.25 * pulse)
-        let pulseRect = NSRect(
-            x: center.x - pulseRadius,
-            y: center.y - pulseRadius,
-            width: pulseRadius * 2,
-            height: pulseRadius * 2
-        )
-        let pulsePath = NSBezierPath(ovalIn: pulseRect)
-        pulsePath.lineWidth = 0.9
-        NSColor.white.withAlphaComponent(0.4).setStroke()
-        pulsePath.stroke()
-    }
-}
 
 final class StatusIconView: NSView {
     enum State {
@@ -1077,90 +793,7 @@ final class StatusIconView: NSView {
     }
 
     private func drawIdle(in rect: NSRect) {
-        let side = min(rect.width, rect.height)
-        let square = CGRect(
-            x: rect.midX - side / 2,
-            y: rect.midY - side / 2,
-            width: side,
-            height: side
-        ).insetBy(dx: 2.5, dy: 2.5)
-        let center = CGPoint(x: square.midX, y: square.midY)
-        let maxRadius = min(square.width, square.height) / 2
-
-        let outerRadius = maxRadius * 0.86
-        let outerPath = NSBezierPath(ovalIn: CGRect(
-            x: center.x - outerRadius,
-            y: center.y - outerRadius,
-            width: outerRadius * 2,
-            height: outerRadius * 2
-        ))
-        NSColor.labelColor.withAlphaComponent(0.25).setStroke()
-        outerPath.lineWidth = 1
-        outerPath.stroke()
-
-        let innerRadius = outerRadius * 0.74
-        let innerPath = NSBezierPath(ovalIn: CGRect(
-            x: center.x - innerRadius,
-            y: center.y - innerRadius,
-            width: innerRadius * 2,
-            height: innerRadius * 2
-        ))
-        NSColor.labelColor.withAlphaComponent(0.08).setFill()
-        innerPath.fill()
-
-        let capsuleWidth = innerRadius * 0.72
-        let capsuleHeight = innerRadius * 1.25
-        let capsuleRect = CGRect(
-            x: center.x - capsuleWidth / 2,
-            y: center.y - capsuleHeight / 2 + 1,
-            width: capsuleWidth,
-            height: capsuleHeight
-        )
-        let capsulePath = NSBezierPath(roundedRect: capsuleRect, xRadius: capsuleWidth / 2, yRadius: capsuleWidth / 2)
-        NSColor.labelColor.withAlphaComponent(0.58).setStroke()
-        capsulePath.lineWidth = 1
-        capsulePath.stroke()
-
-        let stemHeight = capsuleHeight * 0.6
-        let stemPath = NSBezierPath()
-        stemPath.move(to: CGPoint(x: center.x, y: center.y - stemHeight / 2 - 1))
-        stemPath.line(to: CGPoint(x: center.x, y: center.y - stemHeight))
-        stemPath.lineWidth = 1
-        NSColor.labelColor.withAlphaComponent(0.6).setStroke()
-        stemPath.stroke()
-
-        let baseWidth = capsuleWidth * 0.9
-        let basePath = NSBezierPath()
-        basePath.move(to: CGPoint(x: center.x - baseWidth / 2, y: center.y - stemHeight - 1.5))
-        basePath.line(to: CGPoint(x: center.x + baseWidth / 2, y: center.y - stemHeight - 1.5))
-        basePath.lineWidth = 1
-        NSColor.labelColor.withAlphaComponent(0.6).setStroke()
-        basePath.stroke()
-
-        let waveRadius = innerRadius * 1
-        for offset in [-1, 1] {
-            let arcPath = NSBezierPath()
-            arcPath.appendArc(
-                withCenter: center,
-                radius: waveRadius,
-                startAngle: CGFloat(offset) * 35 - 90,
-                endAngle: CGFloat(offset) * 65 - 90,
-                clockwise: offset < 0
-            )
-            arcPath.lineWidth = 0.9
-            NSColor.labelColor.withAlphaComponent(0.18).setStroke()
-            arcPath.stroke()
-        }
-
-        let highlightRadius = capsuleWidth * 0.3
-        let highlightRect = CGRect(
-            x: center.x - highlightRadius,
-            y: center.y + capsuleHeight * 0.15 - highlightRadius,
-            width: highlightRadius * 2,
-            height: highlightRadius * 2
-        )
-        NSColor.labelColor.withAlphaComponent(0.1).setFill()
-        NSBezierPath(ovalIn: highlightRect).fill()
+        _ = drawMicSymbol(in: rect, intensity: 1)
     }
 
     private func drawRecording(in rect: NSRect) {
@@ -1170,17 +803,19 @@ final class StatusIconView: NSView {
             y: rect.midY - side / 2,
             width: side,
             height: side
-        ).insetBy(dx: 2, dy: 2)
+        ).insetBy(dx: 2.6, dy: 2.6)
         let center = CGPoint(x: square.midX, y: square.midY)
         let maxRadius = min(square.width, square.height) / 2
-        let intensity = max(0.05, recordingLevel)
+        let rawLevel = max(0, min(1, recordingLevel))
+        let emphasizedLevel = pow(rawLevel, 0.45)
+        let intensity = max(0.05, min(1, emphasizedLevel * 1.1))
         let swell = 0.5 + 0.5 * sin(animationPhase * 1.5)
 
         let baseStrokeColor = NSColor.systemRed.withAlphaComponent(0.9)
-        let softFillColor = NSColor.systemRed.withAlphaComponent(0.2 + 0.4 * intensity)
+        let softFillColor = NSColor.systemRed.withAlphaComponent(0.15 + 0.6 * intensity)
 
         // Outer breathing ring keeps everything centered and small.
-        let outerRadius = min(maxRadius - 1, maxRadius * (0.78 + 0.18 * swell + 0.18 * intensity))
+        let outerRadius = min(maxRadius - 1.2, maxRadius * (0.62 + 0.25 * swell + 0.28 * intensity))
         let outerPath = NSBezierPath(ovalIn: CGRect(
             x: center.x - outerRadius,
             y: center.y - outerRadius,
@@ -1192,7 +827,7 @@ final class StatusIconView: NSView {
         outerPath.stroke()
 
         // Fill inner core.
-        let coreRadius = outerRadius * (0.5 + 0.3 * intensity)
+        let coreRadius = outerRadius * (0.35 + 0.5 * intensity)
         let coreRect = CGRect(
             x: center.x - coreRadius,
             y: center.y - coreRadius,
@@ -1203,8 +838,8 @@ final class StatusIconView: NSView {
         NSBezierPath(ovalIn: coreRect).fill()
 
         // Tall capsule to hint at a mic stem, keeps design symmetric.
-        let capsuleHeight = coreRadius * (1.2 + 0.25 * swell)
-        let capsuleWidth = coreRadius * 0.58
+        let capsuleHeight = coreRadius * (1.1 + 0.4 * swell + 0.2 * intensity)
+        let capsuleWidth = coreRadius * (0.45 + 0.4 * intensity)
         let capsuleRect = CGRect(
             x: center.x - capsuleWidth / 2,
             y: center.y - capsuleHeight / 2,
@@ -1217,18 +852,19 @@ final class StatusIconView: NSView {
         capsulePath.stroke()
 
         // Symmetric opening wave arcs on top & bottom, animated by amplitude.
-        let openingAngle = 34 + intensity * 48
-        let waveLayers = 3
+        let openingAngle = 28 + intensity * 90
+        let waveLayers = 4
         for layer in 0..<waveLayers {
             let progress = CGFloat(layer) / CGFloat(waveLayers)
-            let rawRadius = coreRadius + 4 + progress * (maxRadius * 0.7 - coreRadius)
-            let radius = min(rawRadius, maxRadius - 1)
-            let alpha = (0.35 - progress * 0.2) * (0.6 + 0.35 * intensity)
-            let thickness = 1 + (1 - progress) * 0.5
-            let currentOpening = openingAngle + CGFloat(layer) * 7 + intensity * 22
+            let rawRadius = coreRadius + 4 + progress * (maxRadius * 0.8 - coreRadius)
+            let radius = min(rawRadius, maxRadius - 1.5)
+            let alpha = (0.3 - progress * 0.18) * (0.65 + 0.45 * intensity)
+            let thickness = 0.9 + (1 - progress) * (0.9 + 0.4 * intensity)
+            let currentOpening = openingAngle + CGFloat(layer) * (8 + intensity * 6) + intensity * 28
             let start = -currentOpening
             let end = currentOpening
-            let phaseShift = animationPhase * (0.8 + CGFloat(layer) * 0.15)
+            let rotationFactor = 0.2 + intensity * 1.6
+            let phaseShift = animationPhase * rotationFactor + CGFloat(layer) * 0.08
 
             for offset in [CGFloat.pi / 2, -CGFloat.pi / 2] {
                 let arcPath = NSBezierPath()
@@ -1247,26 +883,145 @@ final class StatusIconView: NSView {
     }
 
     private func drawProcessing(in rect: NSRect) {
-        let dotCount = 3
-        let spacing: CGFloat = 6
-        let radius: CGFloat = 2
-        let totalWidth = CGFloat(dotCount - 1) * spacing
-        var currentX = rect.midX - totalWidth / 2
-        let centerY = rect.midY
+        let metrics = drawMicSymbol(in: rect, intensity: 0.55)
+        let center = metrics.center
+        let orbitRadius = min(metrics.orbitRadius + 3, metrics.maxRadius - 1.5)
 
-        for index in 0..<dotCount {
-            let phase = animationPhase + CGFloat(index) * 0.8
-            let alpha = 0.25 + 0.65 * (0.5 + 0.5 * sin(phase))
-            let dotRect = CGRect(
-                x: currentX - radius,
-                y: centerY - radius,
-                width: radius * 2,
-                height: radius * 2
+        let trackRect = CGRect(
+            x: center.x - orbitRadius,
+            y: center.y - orbitRadius,
+            width: orbitRadius * 2,
+            height: orbitRadius * 2
+        )
+        let trackPath = NSBezierPath(ovalIn: trackRect)
+        trackPath.lineWidth = 0.8
+        NSColor.systemGreen.withAlphaComponent(0.15).setStroke()
+        trackPath.stroke()
+
+        let dotRadius: CGFloat = 2.1
+        let baseAngle = animationPhase * 1.6
+        let angles: [CGFloat] = [baseAngle, -baseAngle + .pi]
+
+        for adjustedAngle in angles {
+            let position = CGPoint(
+                x: center.x + cos(adjustedAngle) * orbitRadius,
+                y: center.y + sin(adjustedAngle) * orbitRadius
             )
-            NSColor.labelColor.withAlphaComponent(alpha).setFill()
+
+            let arcSweep: CGFloat = 50
+            let startAngle = adjustedAngle * 180 / .pi - arcSweep / 2
+            let arcPath = NSBezierPath()
+            arcPath.appendArc(
+                withCenter: center,
+                radius: orbitRadius,
+                startAngle: startAngle,
+                endAngle: startAngle + arcSweep,
+                clockwise: false
+            )
+            arcPath.lineWidth = 0.9
+            NSColor.systemGreen.withAlphaComponent(0.18).setStroke()
+            arcPath.stroke()
+
+            let dotRect = CGRect(
+                x: position.x - dotRadius,
+                y: position.y - dotRadius,
+                width: dotRadius * 2,
+                height: dotRadius * 2
+            )
+            NSColor.systemGreen.withAlphaComponent(0.85).setFill()
             NSBezierPath(ovalIn: dotRect).fill()
-            currentX += spacing
         }
+    }
+
+    @discardableResult
+    private func drawMicSymbol(in rect: NSRect, intensity rawIntensity: CGFloat) -> (center: CGPoint, orbitRadius: CGFloat, maxRadius: CGFloat) {
+        let intensity = max(0, min(1, rawIntensity))
+        let side = min(rect.width, rect.height)
+        let square = CGRect(
+            x: rect.midX - side / 2,
+            y: rect.midY - side / 2,
+            width: side,
+            height: side
+        ).insetBy(dx: 3, dy: 3)
+        let center = CGPoint(x: square.midX, y: square.midY)
+        let maxRadius = min(square.width, square.height) / 2
+
+        let outerRadius = maxRadius * 0.8
+        let outerPath = NSBezierPath(ovalIn: CGRect(
+            x: center.x - outerRadius,
+            y: center.y - outerRadius,
+            width: outerRadius * 2,
+            height: outerRadius * 2
+        ))
+        NSColor.labelColor.withAlphaComponent(0.25 * intensity).setStroke()
+        outerPath.lineWidth = 1
+        outerPath.stroke()
+
+        let innerRadius = outerRadius * 0.72
+        let innerPath = NSBezierPath(ovalIn: CGRect(
+            x: center.x - innerRadius,
+            y: center.y - innerRadius,
+            width: innerRadius * 2,
+            height: innerRadius * 2
+        ))
+        NSColor.labelColor.withAlphaComponent(0.08 * intensity).setFill()
+        innerPath.fill()
+
+        let capsuleWidth = innerRadius * 0.72
+        let capsuleHeight = innerRadius * 1.25
+        let capsuleRect = CGRect(
+            x: center.x - capsuleWidth / 2,
+            y: center.y - capsuleHeight / 2 + 1,
+            width: capsuleWidth,
+            height: capsuleHeight
+        )
+        let capsulePath = NSBezierPath(roundedRect: capsuleRect, xRadius: capsuleWidth / 2, yRadius: capsuleWidth / 2)
+        NSColor.labelColor.withAlphaComponent(0.58 * intensity).setStroke()
+        capsulePath.lineWidth = 1
+        capsulePath.stroke()
+
+        let stemHeight = capsuleHeight * 0.6
+        let stemPath = NSBezierPath()
+        stemPath.move(to: CGPoint(x: center.x, y: center.y - stemHeight / 2 - 1))
+        stemPath.line(to: CGPoint(x: center.x, y: center.y - stemHeight))
+        stemPath.lineWidth = 1
+        NSColor.labelColor.withAlphaComponent(0.6 * intensity).setStroke()
+        stemPath.stroke()
+
+        let baseWidth = capsuleWidth * 0.9
+        let basePath = NSBezierPath()
+        basePath.move(to: CGPoint(x: center.x - baseWidth / 2, y: center.y - stemHeight - 1.5))
+        basePath.line(to: CGPoint(x: center.x + baseWidth / 2, y: center.y - stemHeight - 1.5))
+        basePath.lineWidth = 1
+        NSColor.labelColor.withAlphaComponent(0.6 * intensity).setStroke()
+        basePath.stroke()
+
+        let waveRadius = innerRadius * 1
+        for offset in [-1, 1] {
+            let arcPath = NSBezierPath()
+            arcPath.appendArc(
+                withCenter: center,
+                radius: waveRadius,
+                startAngle: CGFloat(offset) * 35 - 90,
+                endAngle: CGFloat(offset) * 65 - 90,
+                clockwise: offset < 0
+            )
+            arcPath.lineWidth = 0.9
+            NSColor.labelColor.withAlphaComponent(0.18 * intensity).setStroke()
+            arcPath.stroke()
+        }
+
+        let highlightRadius = capsuleWidth * 0.3
+        let highlightRect = CGRect(
+            x: center.x - highlightRadius,
+            y: center.y + capsuleHeight * 0.15 - highlightRadius,
+            width: highlightRadius * 2,
+            height: highlightRadius * 2
+        )
+        NSColor.labelColor.withAlphaComponent(0.1 * intensity).setFill()
+        NSBezierPath(ovalIn: highlightRect).fill()
+
+        return (center, outerRadius, maxRadius)
     }
 
     private func updateAnimationTimer() {
@@ -1290,7 +1045,18 @@ final class StatusIconView: NSView {
         timer.schedule(deadline: .now(), repeating: .milliseconds(48))
         timer.setEventHandler { [weak self] in
             guard let self else { return }
-            self.animationPhase = (self.animationPhase + 0.18).truncatingRemainder(dividingBy: .pi * 2)
+            let speed: CGFloat
+            switch self.state {
+            case .idle:
+                speed = 0.08
+            case .recording:
+                let level = max(0, min(1, self.recordingLevel))
+                let boosted = pow(level, 1.1)
+                speed = 0.02 + 0.75 * boosted
+            case .processing:
+                speed = 0.22
+            }
+            self.animationPhase = (self.animationPhase + speed).truncatingRemainder(dividingBy: .pi * 2)
             self.needsDisplay = true
         }
         animationTimer = timer
@@ -1322,13 +1088,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let dictationAdvisor = DictationShortcutAdvisor()
     private let settings = AppSettings()
     private var preferencesWindowController: PreferencesWindowController?
-    private let caretLocator = TextCursorLocator()
-    private let cursorOverlay = CursorLevelOverlay()
     private var state: CaptureState = .idle
+    private var lastPasteDate: Date?
+    private let pasteBreakInterval: TimeInterval = 6
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupStatusItem()
-        caretLocator.requestAccessibilityAuthorizationIfNeeded()
         do {
             try configureBridge()
             configureHotkey()
@@ -1336,8 +1101,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             recorder.levelUpdateHandler = { [weak self] level in
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
-                    let caretPoint = self.caretLocator.currentCaretPoint()
-                    self.cursorOverlay.update(level: CGFloat(level), caretPoint: caretPoint)
                     if case .recording = self.state {
                         self.statusIconView.updateRecordingLevel(CGFloat(level))
                     }
@@ -1482,19 +1245,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try recorder.beginRecording(into: audioURL)
             state = .recording(url: audioURL)
             statusIconView.state = .recording
-            cursorOverlay.primeAnchor(with: caretLocator.currentCaretPoint())
-            cursorOverlay.show()
         } catch {
             state = .idle
             statusIconView.state = .idle
-            cursorOverlay.hide()
             presentAlert(message: "Recording Error", informativeText: error.localizedDescription)
         }
     }
 
     private func finishPressToTalk() {
         guard case .recording(let url) = state else { return }
-        cursorOverlay.hide()
         recorder.stopRecording()
         state = .processing
         statusIconView.state = .processing
@@ -1524,15 +1283,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func presentTranscript(_ text: String) {
         resetState()
+        let normalizedText = normalizedTranscript(text)
+        let trimmed = normalizedText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed != "[BLANK_AUDIO]" else { return }
         if settings.autoPasteEnabled {
+            let outgoingText = preparedTranscriptForPasting(original: normalizedText, trimmed: trimmed)
             do {
-                try pasteController.paste(text: text)
+                try pasteController.paste(text: outgoingText)
+                lastPasteDate = Date()
             } catch {
                 presentAlert(message: "Paste Error", informativeText: error.localizedDescription)
             }
         } else {
-            copyToClipboard(text)
-            presentAlert(message: "Transcription Complete", informativeText: "Transcript copied to clipboard:\n\n\(text)")
+            copyToClipboard(normalizedText)
+            presentAlert(message: "Transcription Complete", informativeText: "Transcript copied to clipboard:\n\n\(normalizedText)")
         }
     }
 
@@ -1544,7 +1308,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func resetState() {
         state = .idle
         statusIconView.state = .idle
-        cursorOverlay.hide()
     }
 
     private func presentAlert(message: String, informativeText: String) {
@@ -1558,6 +1321,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
+    }
+
+    private func normalizedTranscript(_ text: String) -> String {
+        guard !settings.insertNewlineOnBreak else { return text }
+        let newlineSet = CharacterSet.newlines
+        let segments = text.components(separatedBy: newlineSet)
+        let joined = segments.joined(separator: " ")
+        return joined.replacingOccurrences(of: #" {2,}"#, with: " ", options: .regularExpression)
+    }
+
+    private func preparedTranscriptForPasting(original: String, trimmed: String) -> String {
+        guard !original.isEmpty else { return original }
+        var prefix = ""
+        if settings.insertNewlineOnBreak,
+           shouldInsertBreakBeforePaste(),
+           !trimmed.isEmpty,
+           !original.hasPrefix("\n") {
+            prefix.append("\n")
+        }
+        if settings.prependSpaceBeforePaste,
+           !trimmed.isEmpty,
+           !startsWithLeadingWhitespace(original) {
+            prefix.append(" ")
+        }
+        return prefix.isEmpty ? original : prefix + original
+    }
+
+    private func shouldInsertBreakBeforePaste() -> Bool {
+        guard let lastPasteDate else { return false }
+        return Date().timeIntervalSince(lastPasteDate) >= pasteBreakInterval
+    }
+
+    private func startsWithLeadingWhitespace(_ text: String) -> Bool {
+        guard let firstScalar = text.unicodeScalars.first else { return false }
+        return CharacterSet.whitespacesAndNewlines.contains(firstScalar)
     }
 }
 
