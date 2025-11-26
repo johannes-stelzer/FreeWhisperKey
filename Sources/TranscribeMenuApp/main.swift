@@ -759,6 +759,7 @@ final class StatusIconView: NSView {
 
     private var recordingLevel: CGFloat = 0
     private var animationPhase: CGFloat = 0
+    private var animationVelocity: CGFloat = 0
     private var animationTimer: DispatchSourceTimer?
 
     override var isOpaque: Bool { false }
@@ -863,7 +864,7 @@ final class StatusIconView: NSView {
             let currentOpening = openingAngle + CGFloat(layer) * (8 + intensity * 6) + intensity * 28
             let start = -currentOpening
             let end = currentOpening
-            let rotationFactor = 0.2 + intensity * 1.6
+            let rotationFactor = 0.1 + intensity * 0.6
             let phaseShift = animationPhase * rotationFactor + CGFloat(layer) * 0.08
 
             for offset in [CGFloat.pi / 2, -CGFloat.pi / 2] {
@@ -1048,12 +1049,16 @@ final class StatusIconView: NSView {
             let speed: CGFloat
             switch self.state {
             case .idle:
+                self.animationVelocity = 0
                 speed = 0.08
             case .recording:
                 let level = max(0, min(1, self.recordingLevel))
                 let boosted = pow(level, 1.1)
-                speed = 0.02 + 0.75 * boosted
+                let targetSpeed: CGFloat = 0.012 + 0.35 * boosted
+                self.animationVelocity += (targetSpeed - self.animationVelocity) * 0.15
+                speed = self.animationVelocity
             case .processing:
+                self.animationVelocity = 0.22
                 speed = 0.22
             }
             self.animationPhase = (self.animationPhase + speed).truncatingRemainder(dividingBy: .pi * 2)
@@ -1089,8 +1094,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let settings = AppSettings()
     private var preferencesWindowController: PreferencesWindowController?
     private var state: CaptureState = .idle
+    private var lastTranscript: String?
     private var lastPasteDate: Date?
     private let pasteBreakInterval: TimeInterval = 6
+    private var copyLastTranscriptItem: NSMenuItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupStatusItem()
@@ -1140,6 +1147,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         preferencesItem.target = self
         menu.addItem(preferencesItem)
 
+        let copyTranscriptItem = NSMenuItem(title: "Copy Last Transcript", action: #selector(copyLastTranscript), keyEquivalent: "")
+        copyTranscriptItem.target = self
+        copyTranscriptItem.isEnabled = false
+        copyLastTranscriptItem = copyTranscriptItem
+        menu.addItem(copyTranscriptItem)
+
         menu.addItem(.separator())
 
         let quitItem = NSMenuItem(title: "Quit FreeWhisperKey", action: #selector(quitApp), keyEquivalent: "q")
@@ -1148,6 +1161,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         item.menu = menu
         statusItem = item
+        updateCopyTranscriptMenuState()
     }
 
     private func configureBridge() throws {
@@ -1286,6 +1300,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let normalizedText = normalizedTranscript(text)
         let trimmed = normalizedText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed != "[BLANK_AUDIO]" else { return }
+        lastTranscript = normalizedText
+        updateCopyTranscriptMenuState()
         if settings.autoPasteEnabled {
             let outgoingText = preparedTranscriptForPasting(original: normalizedText, trimmed: trimmed)
             do {
@@ -1356,6 +1372,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func startsWithLeadingWhitespace(_ text: String) -> Bool {
         guard let firstScalar = text.unicodeScalars.first else { return false }
         return CharacterSet.whitespacesAndNewlines.contains(firstScalar)
+    }
+
+    @objc private func copyLastTranscript() {
+        guard let lastTranscript else { return }
+        copyToClipboard(lastTranscript)
+    }
+
+    private func updateCopyTranscriptMenuState() {
+        copyLastTranscriptItem?.isEnabled = (lastTranscript != nil)
     }
 }
 
