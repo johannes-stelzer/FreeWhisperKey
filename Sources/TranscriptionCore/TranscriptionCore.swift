@@ -6,6 +6,7 @@ public enum TranscriptionError: LocalizedError {
     case recorderFailed(String)
     case bundleMissing(String)
     case whisperFailed(String)
+    case cleanupFailed(String)
 
     public var errorDescription: String? {
         switch self {
@@ -17,6 +18,8 @@ public enum TranscriptionError: LocalizedError {
             return "Bundle configuration error: \(message)"
         case .whisperFailed(let message):
             return "whisper-cli exited with error: \(message)"
+        case .cleanupFailed(let message):
+            return "Secure cleanup failed: \(message)"
         }
     }
 }
@@ -45,6 +48,12 @@ public final class MicRecorder: NSObject, @unchecked Sendable {
         recorder.isMeteringEnabled = true
         guard recorder.record() else {
             throw TranscriptionError.recorderFailed("Unable to start recording.")
+        }
+        do {
+            try SecureFileEraser.enforceUserOnlyPermissions(for: url)
+        } catch {
+            recorder.stop()
+            throw TranscriptionError.recorderFailed("Failed to harden recording file: \(error.localizedDescription)")
         }
         activeRecorder = recorder
         startMetering()
@@ -155,11 +164,8 @@ public struct WhisperBridge: Sendable {
 
     public func transcribe(audioURL: URL) throws -> String {
         let fileManager = FileManager.default
-        let scratchDirectory = fileManager.temporaryDirectory
-            .appendingPathComponent("whisper-\(UUID().uuidString)", isDirectory: true)
-        try fileManager.createDirectory(at: scratchDirectory, withIntermediateDirectories: true)
+        let scratchDirectory = try Self.makeScratchDirectory(fileManager: fileManager)
         let tempBase = scratchDirectory.appendingPathComponent("transcript")
-        defer { try? fileManager.removeItem(at: scratchDirectory) }
 
         let process = Process()
         process.executableURL = executableURL
@@ -173,18 +179,90 @@ public struct WhisperBridge: Sendable {
         let stderrPipe = Pipe()
         process.standardError = stderrPipe
 
-        try process.run()
-        process.waitUntilExit()
+        do {
+            try process.run()
+            process.waitUntilExit()
 
-        if process.terminationStatus != 0 {
-            let data = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-            let message = String(data: data, encoding: .utf8) ?? "unknown error"
-            throw TranscriptionError.whisperFailed(message.trimmingCharacters(in: .whitespacesAndNewlines))
+            if process.terminationStatus != 0 {
+                let data = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+                let message = String(data: data, encoding: .utf8) ?? "unknown error"
+                throw TranscriptionError.whisperFailed(message.trimmingCharacters(in: .whitespacesAndNewlines))
+            }
+
+            let transcriptURL = tempBase.appendingPathExtension("txt")
+            let text = try String(contentsOf: transcriptURL, encoding: .utf8)
+            do {
+                try Self.securelyRemoveScratchDirectory(at: scratchDirectory, fileManager: fileManager)
+            } catch {
+                throw TranscriptionError.cleanupFailed("Cleanup failed after successful transcription: \(error.localizedDescription)")
+            }
+            return text.trimmingCharacters(in: .whitespacesAndNewlines)
+        } catch {
+            do {
+                try Self.securelyRemoveScratchDirectory(at: scratchDirectory, fileManager: fileManager)
+            } catch let cleanupError {
+                let message = "Cleanup failed after error '\(error.localizedDescription)': \(cleanupError.localizedDescription)"
+                throw TranscriptionError.cleanupFailed(message)
+            }
+            throw error
+        }
+    }
+
+    static func makeScratchDirectory(fileManager: FileManager = .default) throws -> URL {
+        let directory = try SecureTemporaryDirectory.make(prefix: "whisper", fileManager: fileManager)
+        return directory
+    }
+
+    static func securelyRemoveScratchDirectory(at url: URL, fileManager: FileManager = .default) throws {
+        guard fileManager.fileExists(atPath: url.path) else { return }
+        var firstError: Error?
+        func record(_ error: Error) {
+            if firstError == nil {
+                firstError = error
+            }
         }
 
-        let transcriptURL = tempBase.appendingPathExtension("txt")
-        let text = try String(contentsOf: transcriptURL, encoding: .utf8)
-        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let contents: [URL]
+        do {
+            contents = try fileManager.contentsOfDirectory(at: url, includingPropertiesForKeys: [.isDirectoryKey], options: [])
+        } catch {
+            contents = []
+            record(error)
+        }
+
+        for entry in contents {
+            var isDirectory: ObjCBool = false
+            let exists = fileManager.fileExists(atPath: entry.path, isDirectory: &isDirectory)
+            guard exists else { continue }
+            if isDirectory.boolValue {
+                do {
+                    try securelyRemoveScratchDirectory(at: entry, fileManager: fileManager)
+                } catch {
+                    record(error)
+                }
+            } else {
+                do {
+                    try SecureFileEraser.zeroOutFile(at: entry, fileManager: fileManager)
+                } catch {
+                    record(error)
+                }
+                do {
+                    try fileManager.removeItem(at: entry)
+                } catch {
+                    record(error)
+                }
+            }
+        }
+
+        do {
+            try fileManager.removeItem(at: url)
+        } catch {
+            record(error)
+        }
+
+        if let error = firstError {
+            throw error
+        }
     }
 }
 

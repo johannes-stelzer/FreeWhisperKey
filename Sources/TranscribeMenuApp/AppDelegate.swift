@@ -1040,7 +1040,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             state = .recording(recording)
             statusIconView.state = .recording
         } catch {
-            recording.cleanup()
+            cleanupRecording(recording, context: "failed to start recording")
             state = .idle
             statusIconView.state = .idle
             presentAlert(message: "Recording Error", informativeText: error.localizedDescription)
@@ -1057,7 +1057,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func transcribeRecording(_ recording: TemporaryRecording) {
         guard let bridge = whisperBridge else {
-            recording.cleanup()
+            cleanupRecording(recording, context: "bundle missing")
             presentAlert(message: "Bundle missing", informativeText: "Rebuild whisper bundle.")
             resetState()
             return
@@ -1065,7 +1065,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let activeBridge = bridge
         workQueue.async { [weak self] in
-            defer { recording.cleanup() }
+            let cleanupTask = {
+                if let owner = self {
+                    Task { @MainActor in
+                        owner.cleanupRecording(recording, context: "transcription session")
+                    }
+                } else {
+                    do {
+                        try recording.cleanup()
+                    } catch {
+                        NSLog("Cleanup warning (background transcription): \(error.localizedDescription)")
+                    }
+                }
+            }
+            defer { cleanupTask() }
             guard let self else { return }
             do {
                 let text = try activeBridge.transcribe(audioURL: recording.url)
@@ -1121,6 +1134,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
+    }
+
+    private func cleanupRecording(_ recording: TemporaryRecording, context: String) {
+        do {
+            try recording.cleanup()
+        } catch {
+            let details = "Failed to securely delete the recording (\(context)): \(error.localizedDescription)"
+            DispatchQueue.main.async { [weak self] in
+                self?.presentAlert(message: "Cleanup Error", informativeText: details)
+            }
+        }
     }
 
     @objc private func copyLastTranscript() {

@@ -24,6 +24,10 @@ let package = Package(
         .executableTarget(
             name: "TranscribeMenuApp",
             dependencies: ["TranscriptionCore"]
+        ),
+        .testTarget(
+            name: "TranscriptionCoreTests",
+            dependencies: ["TranscriptionCore"]
         )
     ]
 )

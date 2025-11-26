@@ -10,56 +10,40 @@ public struct TemporaryRecording: Sendable {
 
         let identifier = UUID().uuidString
         directoryURL = fileManager.temporaryDirectory.appendingPathComponent("freewhisperkey-recording-\(identifier)", isDirectory: true)
-        try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
-
+        try SecureTemporaryDirectory.ensureDirectoryExists(at: directoryURL, fileManager: fileManager)
+        try SecureTemporaryDirectory.markExcludedFromBackup(directoryURL)
         url = directoryURL.appendingPathComponent("\(prefix)-\(identifier).\(fileExtension)")
+        let created = fileManager.createFile(
+            atPath: url.path,
+            contents: nil,
+            attributes: [.posixPermissions: NSNumber(value: Int16(0o600))]
+        )
+        guard created else {
+            throw TranscriptionError.recorderFailed("Unable to create secure recording file at \(url.path).")
+        }
     }
 
-    public func cleanup(fileManager: FileManager = .default) {
-        secureEraseIfNeeded(fileManager: fileManager)
-        try? fileManager.removeItem(at: directoryURL)
-    }
+    public func cleanup(fileManager: FileManager = .default) throws {
+        var firstError: Error?
 
-    private func secureEraseIfNeeded(fileManager: FileManager = .default) {
-        guard secureOverwrite, fileManager.fileExists(atPath: url.path) else {
-            return
-        }
-
-        guard
-            let attributes = try? fileManager.attributesOfItem(atPath: url.path),
-            let sizeValue = attributes[.size] as? NSNumber
-        else {
-            return
-        }
-
-        let chunkSize = 64 * 1024
-        let zeroChunk = Data(repeating: 0, count: chunkSize)
-        var remaining = sizeValue.uint64Value
-
-        guard let handle = try? FileHandle(forWritingTo: url) else {
-            return
-        }
-
-        defer {
-            try? handle.close()
+        if secureOverwrite {
+            do {
+                try SecureFileEraser.zeroOutFile(at: url, fileManager: fileManager)
+            } catch {
+                firstError = error
+            }
         }
 
         do {
-            try handle.seek(toOffset: 0)
-        } catch {
-            return
-        }
-
-        while remaining > 0 {
-            let toWrite = Int(min(UInt64(chunkSize), remaining))
-            if toWrite == chunkSize {
-                handle.write(zeroChunk)
-            } else if toWrite > 0 {
-                handle.write(Data(repeating: 0, count: toWrite))
+            if fileManager.fileExists(atPath: directoryURL.path) {
+                try fileManager.removeItem(at: directoryURL)
             }
-            remaining -= UInt64(toWrite)
+        } catch {
+            firstError = firstError ?? error
         }
 
-        handle.synchronizeFile()
+        if let error = firstError {
+            throw TranscriptionError.cleanupFailed("Temporary recording cleanup failed: \(error.localizedDescription)")
+        }
     }
 }

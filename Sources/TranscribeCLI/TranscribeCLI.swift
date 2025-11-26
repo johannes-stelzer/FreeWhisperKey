@@ -7,7 +7,13 @@ struct TranscribeCLI {
         do {
             let recorder = MicRecorder()
             let recording = try TemporaryRecording(prefix: "mic")
-            defer { recording.cleanup() }
+            defer {
+                do {
+                    try recording.cleanup()
+                } catch {
+                    fputs("Cleanup warning: \(error.localizedDescription)\n", stderr)
+                }
+            }
             print("Recording 5 seconds of audio... (grant microphone access if prompted)")
             try recorder.record(into: recording.url, duration: 5)
             print("Recording saved to \(recording.url.path)")
