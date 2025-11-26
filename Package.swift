@@ -11,7 +11,7 @@ let package = Package(
     products: [
         .library(name: "TranscriptionCore", targets: ["TranscriptionCore"]),
         .executable(name: "TranscribeCLI", targets: ["TranscribeCLI"]),
-        .executable(name: "WhisperKey", targets: ["TranscribeMenuApp"])
+        .executable(name: "FreeWhisperKey", targets: ["TranscribeMenuApp"])
     ],
     targets: [
         .target(

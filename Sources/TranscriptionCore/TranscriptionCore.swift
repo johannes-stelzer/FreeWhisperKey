@@ -23,6 +23,8 @@ public enum TranscriptionError: LocalizedError {
 
 public final class MicRecorder: NSObject, @unchecked Sendable {
     private var activeRecorder: AVAudioRecorder?
+    private var meterTimer: DispatchSourceTimer?
+    public var levelUpdateHandler: ((Float) -> Void)?
 
     public override init() {}
 
@@ -40,15 +42,18 @@ public final class MicRecorder: NSObject, @unchecked Sendable {
 
         let recorder = try AVAudioRecorder(url: url, settings: Self.settings)
         recorder.prepareToRecord()
+        recorder.isMeteringEnabled = true
         guard recorder.record() else {
             throw TranscriptionError.recorderFailed("Unable to start recording.")
         }
         activeRecorder = recorder
+        startMetering()
     }
 
     public func stopRecording() {
         activeRecorder?.stop()
         activeRecorder = nil
+        stopMetering()
     }
 
     public func record(into url: URL, duration: TimeInterval) throws {
@@ -58,6 +63,49 @@ public final class MicRecorder: NSObject, @unchecked Sendable {
             RunLoop.current.run(until: Date().addingTimeInterval(0.05))
         }
         stopRecording()
+    }
+
+    deinit {
+        stopMetering()
+    }
+
+    private func startMetering() {
+        stopMetering()
+        guard activeRecorder != nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.main)
+        timer.schedule(deadline: .now(), repeating: .milliseconds(50))
+        timer.setEventHandler { [weak self] in
+            guard let self, let recorder = self.activeRecorder else {
+                self?.stopMetering()
+                return
+            }
+            recorder.updateMeters()
+            let power = recorder.averagePower(forChannel: 0)
+            self.notifyLevel(Self.normalized(power: power))
+        }
+        meterTimer = timer
+        timer.resume()
+    }
+
+    private func stopMetering() {
+        meterTimer?.cancel()
+        meterTimer = nil
+        notifyLevel(0)
+    }
+
+    private func notifyLevel(_ level: Float) {
+        guard let handler = levelUpdateHandler else { return }
+        DispatchQueue.main.async {
+            handler(level)
+        }
+    }
+
+    private static func normalized(power: Float) -> Float {
+        guard power.isFinite else { return 0 }
+        let minDb: Float = -60
+        if power <= minDb { return 0 }
+        let clamped = min(0, power)
+        return min(1, max(0, (clamped - minDb) / -minDb))
     }
 
     private static func requestPermission() throws -> Bool {

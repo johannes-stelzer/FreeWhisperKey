@@ -1,8 +1,10 @@
 import AppKit
-import ApplicationServices
+@preconcurrency import ApplicationServices
 import Foundation
 import TranscriptionCore
 import UniformTypeIdentifiers
+
+@MainActor private let accessibilityPromptOptionKey = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
 
 final class AppSettings {
     private enum Keys {
@@ -210,7 +212,7 @@ final class PreferencesWindowController: NSWindowController {
         refreshModelOptions()
 
         let behaviorHeader = PreferencesWindowController.makeHeader("Behavior")
-        let behaviorDescription = PreferencesWindowController.makeSubtext("When disabled, WhisperKey copies the result to the clipboard instead of pasting.")
+        let behaviorDescription = PreferencesWindowController.makeSubtext("When disabled, FreeWhisperKey copies the result to the clipboard instead of pasting.")
 
         let modelHeader = PreferencesWindowController.makeHeader("Model")
         let modelDescription = PreferencesWindowController.makeSubtext("Select a bundled ggml model or provide your own file.")
@@ -560,7 +562,7 @@ final class DictationShortcutAdvisor {
         alert.messageText = "Fn key is still reserved for Dictation"
         alert.informativeText = """
 macOS currently launches Dictation when you press Fn, which causes the “processing your voice” popup.
-Disable or reassign the Dictation shortcut (Keyboard → Dictation → Shortcut) so WhisperKey can use Fn uninterrupted.
+Disable or reassign the Dictation shortcut (Keyboard → Dictation → Shortcut) so FreeWhisperKey can use Fn uninterrupted.
 """
         alert.addButton(withTitle: "Open Keyboard Settings")
         alert.addButton(withTitle: "Not Now")
@@ -688,6 +690,619 @@ final class FnHotkeyMonitor {
     }
 }
 
+final class TextCursorLocator {
+    private let systemWideElement = AXUIElementCreateSystemWide()
+    private var didRequestAuthorizationPrompt = false
+
+    @MainActor
+    func requestAccessibilityAuthorizationIfNeeded() {
+        guard !AXIsProcessTrusted(), !didRequestAuthorizationPrompt else { return }
+        didRequestAuthorizationPrompt = true
+        let options = [accessibilityPromptOptionKey: true] as CFDictionary
+        AXIsProcessTrustedWithOptions(options)
+    }
+
+    func currentCaretPoint() -> CGPoint? {
+        guard AXIsProcessTrusted() else { return nil }
+
+        var focusedElement: CFTypeRef?
+        let focusedResult = AXUIElementCopyAttributeValue(
+            systemWideElement,
+            kAXFocusedUIElementAttribute as CFString,
+            &focusedElement
+        )
+        guard focusedResult == .success,
+              let element = focusedElement,
+              CFGetTypeID(element) == AXUIElementGetTypeID() else {
+            return nil
+        }
+        let targetElement = element as! AXUIElement
+
+        var selectedRangeValue: CFTypeRef?
+        let rangeResult = AXUIElementCopyAttributeValue(
+            targetElement,
+            kAXSelectedTextRangeAttribute as CFString,
+            &selectedRangeValue
+        )
+        guard rangeResult == .success,
+              let rangeAX = selectedRangeValue,
+              CFGetTypeID(rangeAX) == AXValueGetTypeID() else {
+            return nil
+        }
+        let rangeValue = rangeAX as! AXValue
+
+        var range = CFRange(location: 0, length: 0)
+        guard AXValueGetType(rangeValue) == .cfRange,
+              AXValueGetValue(rangeValue, .cfRange, &range) else {
+            return nil
+        }
+
+        var insertionRange = CFRange(location: range.location + range.length, length: 0)
+        guard let insertionAX = AXValueCreate(.cfRange, &insertionRange) else {
+            return nil
+        }
+
+        var boundsValue: CFTypeRef?
+        let boundsResult = AXUIElementCopyParameterizedAttributeValue(
+            targetElement,
+            kAXBoundsForRangeParameterizedAttribute as CFString,
+            insertionAX,
+            &boundsValue
+        )
+        guard boundsResult == .success,
+              let boundsAX = boundsValue,
+              CFGetTypeID(boundsAX) == AXValueGetTypeID() else {
+            return nil
+        }
+        let boundsValueAX = boundsAX as! AXValue
+
+        var rect = CGRect.zero
+        guard AXValueGetType(boundsValueAX) == .cgRect,
+              AXValueGetValue(boundsValueAX, .cgRect, &rect) else {
+            return nil
+        }
+
+        return CGPoint(x: rect.midX, y: rect.midY)
+    }
+}
+
+@MainActor
+final class CursorLevelOverlay {
+    private let overlaySize = CGSize(width: 44, height: 44)
+    private let window: NSWindow
+    private let levelView: CursorLevelView
+    private var isVisible = false
+    private var latestLevel: CGFloat = 0
+    private var lastKnownPosition: CGPoint?
+    private var hasShownWindow = false
+
+    init() {
+        levelView = CursorLevelView(frame: NSRect(origin: .zero, size: overlaySize))
+        levelView.autoresizingMask = [.width, .height]
+
+        window = NSWindow(
+            contentRect: NSRect(origin: .zero, size: overlaySize),
+            styleMask: .borderless,
+            backing: .buffered,
+            defer: false
+        )
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.hasShadow = false
+        window.ignoresMouseEvents = true
+        window.level = .screenSaver
+        window.collectionBehavior = [.canJoinAllSpaces, .ignoresCycle, .stationary]
+        window.contentView = levelView
+        window.alphaValue = 0
+    }
+
+    func show() {
+        guard !isVisible else { return }
+        isVisible = true
+        hasShownWindow = false
+        levelView.level = latestLevel
+        if lastKnownPosition != nil {
+            updatePosition()
+            revealWindowIfNeeded()
+        }
+    }
+
+    func hide() {
+        guard isVisible else { return }
+        isVisible = false
+        hasShownWindow = false
+        guard window.isVisible else {
+            levelView.level = 0
+            window.orderOut(nil)
+            return
+        }
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.2
+            window.animator().alphaValue = 0
+        } completionHandler: { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.window.orderOut(nil)
+                self?.levelView.level = 0
+            }
+        }
+    }
+
+    func update(level: CGFloat, caretPoint: CGPoint?) {
+        latestLevel = max(0, min(1, level))
+        if let caretPoint {
+            lastKnownPosition = caretPoint
+        }
+        guard isVisible else { return }
+        levelView.level = latestLevel
+        if lastKnownPosition != nil {
+            updatePosition()
+            revealWindowIfNeeded()
+        }
+    }
+
+    func primeAnchor(with point: CGPoint?) {
+        lastKnownPosition = point
+        if isVisible, lastKnownPosition != nil {
+            updatePosition()
+            revealWindowIfNeeded()
+        }
+    }
+
+    private func updatePosition() {
+        guard let anchor = lastKnownPosition else { return }
+        let origin = NSPoint(
+            x: anchor.x - overlaySize.width / 2,
+            y: anchor.y - overlaySize.height / 2
+        )
+        window.setFrame(NSRect(origin: origin, size: overlaySize), display: false)
+    }
+
+    private func revealWindowIfNeeded() {
+        guard isVisible, !hasShownWindow else { return }
+        hasShownWindow = true
+        window.alphaValue = 0
+        window.orderFront(nil)
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.15
+            window.animator().alphaValue = 1
+        }
+    }
+}
+
+final class CursorLevelView: NSView {
+    var level: CGFloat = 0 {
+        didSet { targetLevel = max(0, min(1, level)) }
+    }
+
+    private var targetLevel: CGFloat = 0
+    private var displayLevel: CGFloat = 0
+    private var animationPhase: CGFloat = 0
+    private var animationTimer: DispatchSourceTimer?
+
+    override var isOpaque: Bool { false }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window != nil {
+            startAnimation()
+        } else {
+            stopAnimation()
+        }
+    }
+
+    deinit {
+        animationTimer?.cancel()
+        animationTimer = nil
+    }
+
+    private func startAnimation() {
+        guard animationTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now(), repeating: .milliseconds(16))
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.animationPhase = self.animationPhase.truncatingRemainder(dividingBy: .pi * 2) + 0.045
+            let easing: CGFloat = 0.18
+            self.displayLevel += (self.targetLevel - self.displayLevel) * easing
+            self.needsDisplay = true
+        }
+        animationTimer = timer
+        timer.resume()
+    }
+
+    private func stopAnimation() {
+        animationTimer?.cancel()
+        animationTimer = nil
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.clear.setFill()
+        dirtyRect.fill()
+
+        let bounds = self.bounds
+        let center = CGPoint(x: bounds.midX, y: bounds.midY)
+        let maxRadius = min(bounds.width, bounds.height) / 2 - 1
+        let activeLevel = displayLevel
+        let pulse = 0.5 + 0.5 * sin(animationPhase * 2)
+
+        let outerRect = NSRect(
+            x: center.x - maxRadius,
+            y: center.y - maxRadius,
+            width: maxRadius * 2,
+            height: maxRadius * 2
+        )
+        let baseAlpha = 0.08 + 0.2 * (activeLevel + pulse * 0.3)
+        NSColor.white.withAlphaComponent(baseAlpha).setFill()
+        NSBezierPath(ovalIn: outerRect).fill()
+
+        let outerStroke = NSBezierPath(ovalIn: outerRect)
+        outerStroke.lineWidth = 1
+        NSColor.black.withAlphaComponent(0.45).setStroke()
+        outerStroke.stroke()
+
+        let arcRadius = maxRadius - 4
+        let startAngle = (animationPhase * 180 / .pi).truncatingRemainder(dividingBy: 360)
+        let sweep = (0.25 + 0.5 * activeLevel) * 320
+        let endAngle = startAngle + sweep
+        let arcWidth = 1.6 + activeLevel * 2.8
+
+        let leadArc = NSBezierPath()
+        leadArc.appendArc(withCenter: center, radius: arcRadius, startAngle: startAngle, endAngle: endAngle, clockwise: false)
+        leadArc.lineWidth = arcWidth
+        NSColor.white.withAlphaComponent(0.95).setStroke()
+        leadArc.stroke()
+
+        let shadowArc = NSBezierPath()
+        shadowArc.appendArc(withCenter: center, radius: arcRadius - 3, startAngle: startAngle - 10, endAngle: endAngle - 10, clockwise: false)
+        shadowArc.lineWidth = arcWidth * 0.7
+        NSColor.black.withAlphaComponent(0.4).setStroke()
+        shadowArc.stroke()
+
+        let dashArc = NSBezierPath()
+        dashArc.appendArc(withCenter: center, radius: arcRadius + 2, startAngle: startAngle + 6, endAngle: endAngle + 6, clockwise: false)
+        dashArc.setLineDash([3, 4], count: 2, phase: animationPhase * 12)
+        dashArc.lineWidth = 1
+        NSColor.white.withAlphaComponent(0.35).setStroke()
+        dashArc.stroke()
+
+        let accentAngle = endAngle * .pi / 180
+        let accentRadius = arcRadius
+        let accentCenter = CGPoint(
+            x: center.x + cos(accentAngle) * accentRadius,
+            y: center.y + sin(accentAngle) * accentRadius
+        )
+        let accentSize = 3 + activeLevel * 3.2
+        let accentRect = NSRect(
+            x: accentCenter.x - accentSize / 2,
+            y: accentCenter.y - accentSize / 2,
+            width: accentSize,
+            height: accentSize
+        )
+        NSColor.white.setFill()
+        NSBezierPath(ovalIn: accentRect).fill()
+        let accentStroke = NSBezierPath(ovalIn: accentRect)
+        accentStroke.lineWidth = 0.9
+        NSColor.black.withAlphaComponent(0.5).setStroke()
+        accentStroke.stroke()
+
+        let coreRadius = (maxRadius - 10) * (0.4 + 0.45 * activeLevel)
+        let coreRect = NSRect(
+            x: center.x - coreRadius,
+            y: center.y - coreRadius,
+            width: coreRadius * 2,
+            height: coreRadius * 2
+        )
+        NSColor.white.withAlphaComponent(0.2 + 0.3 * activeLevel).setFill()
+        NSBezierPath(ovalIn: coreRect).fill()
+        let coreStroke = NSBezierPath(ovalIn: coreRect)
+        coreStroke.lineWidth = 1
+        NSColor.black.withAlphaComponent(0.55).setStroke()
+        coreStroke.stroke()
+
+        let crossLength = coreRadius * 0.55
+        let crossPath = NSBezierPath()
+        crossPath.move(to: CGPoint(x: center.x - crossLength, y: center.y))
+        crossPath.line(to: CGPoint(x: center.x + crossLength, y: center.y))
+        crossPath.move(to: CGPoint(x: center.x, y: center.y - crossLength))
+        crossPath.line(to: CGPoint(x: center.x, y: center.y + crossLength))
+        crossPath.lineWidth = 0.7
+        NSColor.black.withAlphaComponent(0.35).setStroke()
+        crossPath.stroke()
+
+        let pulseRadius = coreRadius * (0.55 + 0.25 * pulse)
+        let pulseRect = NSRect(
+            x: center.x - pulseRadius,
+            y: center.y - pulseRadius,
+            width: pulseRadius * 2,
+            height: pulseRadius * 2
+        )
+        let pulsePath = NSBezierPath(ovalIn: pulseRect)
+        pulsePath.lineWidth = 0.9
+        NSColor.white.withAlphaComponent(0.4).setStroke()
+        pulsePath.stroke()
+    }
+}
+
+final class StatusIconView: NSView {
+    enum State {
+        case idle
+        case recording
+        case processing
+    }
+
+    var state: State = .idle {
+        didSet {
+            guard oldValue != state else { return }
+            updateAnimationTimer()
+            needsDisplay = true
+            if state != .recording {
+                recordingLevel = 0
+            }
+        }
+    }
+
+    private var recordingLevel: CGFloat = 0
+    private var animationPhase: CGFloat = 0
+    private var animationTimer: DispatchSourceTimer?
+
+    override var isOpaque: Bool { false }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        updateAnimationTimer()
+    }
+
+    deinit {
+        animationTimer?.cancel()
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        switch state {
+        case .idle:
+            drawIdle(in: dirtyRect)
+        case .recording:
+            drawRecording(in: dirtyRect)
+        case .processing:
+            drawProcessing(in: dirtyRect)
+        }
+    }
+
+    func updateRecordingLevel(_ level: CGFloat) {
+        let clamped = max(0, min(1, level))
+        guard clamped != recordingLevel else { return }
+        recordingLevel = clamped
+        if state == .recording {
+            needsDisplay = true
+        }
+    }
+
+    private func drawIdle(in rect: NSRect) {
+        let side = min(rect.width, rect.height)
+        let square = CGRect(
+            x: rect.midX - side / 2,
+            y: rect.midY - side / 2,
+            width: side,
+            height: side
+        ).insetBy(dx: 2.5, dy: 2.5)
+        let center = CGPoint(x: square.midX, y: square.midY)
+        let maxRadius = min(square.width, square.height) / 2
+
+        let outerRadius = maxRadius * 0.86
+        let outerPath = NSBezierPath(ovalIn: CGRect(
+            x: center.x - outerRadius,
+            y: center.y - outerRadius,
+            width: outerRadius * 2,
+            height: outerRadius * 2
+        ))
+        NSColor.labelColor.withAlphaComponent(0.25).setStroke()
+        outerPath.lineWidth = 1
+        outerPath.stroke()
+
+        let innerRadius = outerRadius * 0.74
+        let innerPath = NSBezierPath(ovalIn: CGRect(
+            x: center.x - innerRadius,
+            y: center.y - innerRadius,
+            width: innerRadius * 2,
+            height: innerRadius * 2
+        ))
+        NSColor.labelColor.withAlphaComponent(0.08).setFill()
+        innerPath.fill()
+
+        let capsuleWidth = innerRadius * 0.72
+        let capsuleHeight = innerRadius * 1.25
+        let capsuleRect = CGRect(
+            x: center.x - capsuleWidth / 2,
+            y: center.y - capsuleHeight / 2 + 1,
+            width: capsuleWidth,
+            height: capsuleHeight
+        )
+        let capsulePath = NSBezierPath(roundedRect: capsuleRect, xRadius: capsuleWidth / 2, yRadius: capsuleWidth / 2)
+        NSColor.labelColor.withAlphaComponent(0.58).setStroke()
+        capsulePath.lineWidth = 1
+        capsulePath.stroke()
+
+        let stemHeight = capsuleHeight * 0.6
+        let stemPath = NSBezierPath()
+        stemPath.move(to: CGPoint(x: center.x, y: center.y - stemHeight / 2 - 1))
+        stemPath.line(to: CGPoint(x: center.x, y: center.y - stemHeight))
+        stemPath.lineWidth = 1
+        NSColor.labelColor.withAlphaComponent(0.6).setStroke()
+        stemPath.stroke()
+
+        let baseWidth = capsuleWidth * 0.9
+        let basePath = NSBezierPath()
+        basePath.move(to: CGPoint(x: center.x - baseWidth / 2, y: center.y - stemHeight - 1.5))
+        basePath.line(to: CGPoint(x: center.x + baseWidth / 2, y: center.y - stemHeight - 1.5))
+        basePath.lineWidth = 1
+        NSColor.labelColor.withAlphaComponent(0.6).setStroke()
+        basePath.stroke()
+
+        let waveRadius = innerRadius * 1
+        for offset in [-1, 1] {
+            let arcPath = NSBezierPath()
+            arcPath.appendArc(
+                withCenter: center,
+                radius: waveRadius,
+                startAngle: CGFloat(offset) * 35 - 90,
+                endAngle: CGFloat(offset) * 65 - 90,
+                clockwise: offset < 0
+            )
+            arcPath.lineWidth = 0.9
+            NSColor.labelColor.withAlphaComponent(0.18).setStroke()
+            arcPath.stroke()
+        }
+
+        let highlightRadius = capsuleWidth * 0.3
+        let highlightRect = CGRect(
+            x: center.x - highlightRadius,
+            y: center.y + capsuleHeight * 0.15 - highlightRadius,
+            width: highlightRadius * 2,
+            height: highlightRadius * 2
+        )
+        NSColor.labelColor.withAlphaComponent(0.1).setFill()
+        NSBezierPath(ovalIn: highlightRect).fill()
+    }
+
+    private func drawRecording(in rect: NSRect) {
+        let side = min(rect.width, rect.height)
+        let square = CGRect(
+            x: rect.midX - side / 2,
+            y: rect.midY - side / 2,
+            width: side,
+            height: side
+        ).insetBy(dx: 2, dy: 2)
+        let center = CGPoint(x: square.midX, y: square.midY)
+        let maxRadius = min(square.width, square.height) / 2
+        let intensity = max(0.05, recordingLevel)
+        let swell = 0.5 + 0.5 * sin(animationPhase * 1.5)
+
+        let baseStrokeColor = NSColor.systemRed.withAlphaComponent(0.9)
+        let softFillColor = NSColor.systemRed.withAlphaComponent(0.2 + 0.4 * intensity)
+
+        // Outer breathing ring keeps everything centered and small.
+        let outerRadius = min(maxRadius - 1, maxRadius * (0.78 + 0.18 * swell + 0.18 * intensity))
+        let outerPath = NSBezierPath(ovalIn: CGRect(
+            x: center.x - outerRadius,
+            y: center.y - outerRadius,
+            width: outerRadius * 2,
+            height: outerRadius * 2
+        ))
+        outerPath.lineWidth = 1.3
+        baseStrokeColor.setStroke()
+        outerPath.stroke()
+
+        // Fill inner core.
+        let coreRadius = outerRadius * (0.5 + 0.3 * intensity)
+        let coreRect = CGRect(
+            x: center.x - coreRadius,
+            y: center.y - coreRadius,
+            width: coreRadius * 2,
+            height: coreRadius * 2
+        )
+        softFillColor.setFill()
+        NSBezierPath(ovalIn: coreRect).fill()
+
+        // Tall capsule to hint at a mic stem, keeps design symmetric.
+        let capsuleHeight = coreRadius * (1.2 + 0.25 * swell)
+        let capsuleWidth = coreRadius * 0.58
+        let capsuleRect = CGRect(
+            x: center.x - capsuleWidth / 2,
+            y: center.y - capsuleHeight / 2,
+            width: capsuleWidth,
+            height: capsuleHeight
+        )
+        let capsulePath = NSBezierPath(roundedRect: capsuleRect, xRadius: capsuleWidth / 2, yRadius: capsuleWidth / 2)
+        NSColor.white.withAlphaComponent(0.85).setStroke()
+        capsulePath.lineWidth = 1
+        capsulePath.stroke()
+
+        // Symmetric opening wave arcs on top & bottom, animated by amplitude.
+        let openingAngle = 34 + intensity * 48
+        let waveLayers = 3
+        for layer in 0..<waveLayers {
+            let progress = CGFloat(layer) / CGFloat(waveLayers)
+            let rawRadius = coreRadius + 4 + progress * (maxRadius * 0.7 - coreRadius)
+            let radius = min(rawRadius, maxRadius - 1)
+            let alpha = (0.35 - progress * 0.2) * (0.6 + 0.35 * intensity)
+            let thickness = 1 + (1 - progress) * 0.5
+            let currentOpening = openingAngle + CGFloat(layer) * 7 + intensity * 22
+            let start = -currentOpening
+            let end = currentOpening
+            let phaseShift = animationPhase * (0.8 + CGFloat(layer) * 0.15)
+
+            for offset in [CGFloat.pi / 2, -CGFloat.pi / 2] {
+                let arcPath = NSBezierPath()
+                arcPath.appendArc(
+                    withCenter: center,
+                    radius: radius,
+                    startAngle: start + phaseShift * 60 + offset * 180 / .pi,
+                    endAngle: end + phaseShift * 60 + offset * 180 / .pi,
+                    clockwise: offset < 0
+                )
+                arcPath.lineWidth = thickness
+                NSColor.white.withAlphaComponent(alpha).setStroke()
+                arcPath.stroke()
+            }
+        }
+    }
+
+    private func drawProcessing(in rect: NSRect) {
+        let dotCount = 3
+        let spacing: CGFloat = 6
+        let radius: CGFloat = 2
+        let totalWidth = CGFloat(dotCount - 1) * spacing
+        var currentX = rect.midX - totalWidth / 2
+        let centerY = rect.midY
+
+        for index in 0..<dotCount {
+            let phase = animationPhase + CGFloat(index) * 0.8
+            let alpha = 0.25 + 0.65 * (0.5 + 0.5 * sin(phase))
+            let dotRect = CGRect(
+                x: currentX - radius,
+                y: centerY - radius,
+                width: radius * 2,
+                height: radius * 2
+            )
+            NSColor.labelColor.withAlphaComponent(alpha).setFill()
+            NSBezierPath(ovalIn: dotRect).fill()
+            currentX += spacing
+        }
+    }
+
+    private func updateAnimationTimer() {
+        let shouldAnimate: Bool
+        switch state {
+        case .idle:
+            shouldAnimate = false
+        case .recording, .processing:
+            shouldAnimate = true
+        }
+        if shouldAnimate {
+            startAnimationTimer()
+        } else {
+            stopAnimationTimer()
+        }
+    }
+
+    private func startAnimationTimer() {
+        guard animationTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now(), repeating: .milliseconds(48))
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.animationPhase = (self.animationPhase + 0.18).truncatingRemainder(dividingBy: .pi * 2)
+            self.needsDisplay = true
+        }
+        animationTimer = timer
+        timer.resume()
+    }
+
+    private func stopAnimationTimer() {
+        animationTimer?.cancel()
+        animationTimer = nil
+    }
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private enum CaptureState {
@@ -697,23 +1312,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private var statusItem: NSStatusItem?
+    private let statusIconView = StatusIconView()
     private let recorder = MicRecorder()
     private var whisperBundle: WhisperBundle?
     private var whisperBridge: WhisperBridge?
-    private let workQueue = DispatchQueue(label: "com.whisperkey.menuapp")
+    private let workQueue = DispatchQueue(label: "com.freewhisperkey.menuapp")
     private let hotkeyMonitor = FnHotkeyMonitor()
     private let pasteController = PasteController()
     private let dictationAdvisor = DictationShortcutAdvisor()
     private let settings = AppSettings()
     private var preferencesWindowController: PreferencesWindowController?
+    private let caretLocator = TextCursorLocator()
+    private let cursorOverlay = CursorLevelOverlay()
     private var state: CaptureState = .idle
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupStatusItem()
+        caretLocator.requestAccessibilityAuthorizationIfNeeded()
         do {
             try configureBridge()
             configureHotkey()
             dictationAdvisor.promptIfNeeded()
+            recorder.levelUpdateHandler = { [weak self] level in
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    let caretPoint = self.caretLocator.currentCaretPoint()
+                    self.cursorOverlay.update(level: CGFloat(level), caretPoint: caretPoint)
+                    if case .recording = self.state {
+                        self.statusIconView.updateRecordingLevel(CGFloat(level))
+                    }
+                }
+            }
         } catch {
             presentAlert(message: error.localizedDescription, informativeText: "Menu app will quit.")
             NSApplication.shared.terminate(self)
@@ -721,8 +1350,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func setupStatusItem() {
-        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        item.button?.title = "WK"
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        if let button = item.button {
+            button.title = ""
+            button.image = nil
+            statusIconView.translatesAutoresizingMaskIntoConstraints = false
+            button.addSubview(statusIconView)
+            NSLayoutConstraint.activate([
+                statusIconView.leadingAnchor.constraint(equalTo: button.leadingAnchor),
+                statusIconView.trailingAnchor.constraint(equalTo: button.trailingAnchor),
+                statusIconView.topAnchor.constraint(equalTo: button.topAnchor),
+                statusIconView.bottomAnchor.constraint(equalTo: button.bottomAnchor)
+            ])
+        }
+        statusIconView.state = .idle
         let menu = NSMenu()
 
         let hintItem = NSMenuItem()
@@ -738,7 +1379,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
-        let quitItem = NSMenuItem(title: "Quit WhisperKey", action: #selector(quitApp), keyEquivalent: "q")
+        let quitItem = NSMenuItem(title: "Quit FreeWhisperKey", action: #selector(quitApp), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
 
@@ -840,19 +1481,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         do {
             try recorder.beginRecording(into: audioURL)
             state = .recording(url: audioURL)
-            statusItem?.button?.title = "REC"
+            statusIconView.state = .recording
+            cursorOverlay.primeAnchor(with: caretLocator.currentCaretPoint())
+            cursorOverlay.show()
         } catch {
             state = .idle
-            statusItem?.button?.title = "WK"
+            statusIconView.state = .idle
+            cursorOverlay.hide()
             presentAlert(message: "Recording Error", informativeText: error.localizedDescription)
         }
     }
 
     private func finishPressToTalk() {
         guard case .recording(let url) = state else { return }
+        cursorOverlay.hide()
         recorder.stopRecording()
         state = .processing
-        statusItem?.button?.title = "…"
+        statusIconView.state = .processing
         transcribeFile(at: url)
     }
 
@@ -898,7 +1543,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func resetState() {
         state = .idle
-        statusItem?.button?.title = "WK"
+        statusIconView.state = .idle
+        cursorOverlay.hide()
     }
 
     private func presentAlert(message: String, informativeText: String) {
