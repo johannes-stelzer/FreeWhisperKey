@@ -16,7 +16,17 @@ struct TranscribeCLI {
             let bridge = WhisperBridge(executableURL: bundle.binary, modelURL: bundle.defaultModel)
             print("Running whisper-cli...")
             let transcript = try bridge.transcribe(audioURL: audioURL)
-            print("\nTranscription:\n\(transcript)\n")
+            let delivery = TranscriptDelivery()
+            let config = TranscriptDeliveryConfiguration(
+                autoPasteEnabled: false,
+                prependSpaceBeforePaste: false,
+                insertNewlineOnBreak: true
+            )
+            if let result = delivery.processTranscript(transcript, configuration: config) {
+                print("\nTranscription:\n\(result.normalizedText)\n")
+            } else {
+                print("\nTranscription:\n\(transcript)\n")
+            }
         } catch {
             fputs("Error: \(error.localizedDescription)\n", stderr)
             exit(EXIT_FAILURE)

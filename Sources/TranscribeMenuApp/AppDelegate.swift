@@ -4,140 +4,6 @@ import Foundation
 import TranscriptionCore
 import UniformTypeIdentifiers
 
-final class AppSettings {
-    private enum Keys {
-        static let autoPasteEnabled = "autoPasteEnabled"
-        static let selectedModelFilename = "selectedModelFilename"
-        static let customModelPath = "customModelPath"
-        static let prependSpaceBeforePaste = "prependSpaceBeforePaste"
-        static let insertNewlineOnBreak = "insertNewlineOnBreak"
-    }
-
-    private let defaults = UserDefaults.standard
-
-    var autoPasteEnabled: Bool {
-        get {
-            if defaults.object(forKey: Keys.autoPasteEnabled) == nil {
-                return true
-            }
-            return defaults.bool(forKey: Keys.autoPasteEnabled)
-        }
-        set {
-            defaults.set(newValue, forKey: Keys.autoPasteEnabled)
-        }
-    }
-
-    var selectedModelFilename: String? {
-        get { defaults.string(forKey: Keys.selectedModelFilename) }
-        set { defaults.set(newValue, forKey: Keys.selectedModelFilename) }
-    }
-
-    var customModelPath: String? {
-        get { defaults.string(forKey: Keys.customModelPath) }
-        set {
-            if let newValue = newValue, !newValue.isEmpty {
-                defaults.set(newValue, forKey: Keys.customModelPath)
-            } else {
-                defaults.removeObject(forKey: Keys.customModelPath)
-            }
-        }
-    }
-
-    var prependSpaceBeforePaste: Bool {
-        get {
-            if defaults.object(forKey: Keys.prependSpaceBeforePaste) == nil {
-                return true
-            }
-            return defaults.bool(forKey: Keys.prependSpaceBeforePaste)
-        }
-        set {
-            defaults.set(newValue, forKey: Keys.prependSpaceBeforePaste)
-        }
-    }
-
-    var insertNewlineOnBreak: Bool {
-        get { defaults.bool(forKey: Keys.insertNewlineOnBreak) }
-        set { defaults.set(newValue, forKey: Keys.insertNewlineOnBreak) }
-    }
-}
-
-enum KnownModel: String, CaseIterable {
-    case tiny = "tiny"
-    case tinyEn = "tiny.en"
-    case base = "base"
-    case baseEn = "base.en"
-    case small = "small"
-    case smallEn = "small.en"
-    case medium = "medium"
-    case mediumEn = "medium.en"
-    case largeV1 = "large-v1"
-    case largeV2 = "large-v2"
-    case largeV3 = "large-v3"
-
-    var displayName: String {
-        switch self {
-        case .tiny: return "Tiny"
-        case .tinyEn: return "Tiny (English)"
-        case .base: return "Base"
-        case .baseEn: return "Base (English)"
-        case .small: return "Small"
-        case .smallEn: return "Small (English)"
-        case .medium: return "Medium"
-        case .mediumEn: return "Medium (English)"
-        case .largeV1: return "Large v1"
-        case .largeV2: return "Large v2"
-        case .largeV3: return "Large v3"
-        }
-    }
-
-    var fileName: String { "ggml-\(rawValue).bin" }
-
-    var downloadURL: URL {
-        URL(string: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/\(fileName)?download=1")!
-    }
-
-    var expectedBytes: Int64? {
-        switch self {
-        case .tiny, .tinyEn:
-            return 39_000_000
-        case .base, .baseEn:
-            return 141_000_000
-        case .small, .smallEn:
-            return 466_000_000
-        case .medium, .mediumEn:
-            return 1_553_000_000
-        case .largeV1, .largeV2:
-            return 2_884_000_000
-        case .largeV3:
-            return 3_088_000_000
-        }
-    }
-}
-
-struct ModelOption {
-    enum Kind {
-        case known(KnownModel)
-        case local
-        case custom
-    }
-
-    let kind: Kind
-    let displayName: String
-    let fileName: String?
-    let available: Bool
-
-    var menuTitle: String {
-        available ? displayName : "\(displayName) (download)"
-    }
-
-    var needsDownload: Bool {
-        if case .known = kind {
-            return !available
-        }
-        return false
-    }
-}
-
 final class ModelDownloadDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
     var progressHandler: ((Double) -> Void)?
     var completionHandler: ((Result<URL, Error>) -> Void)?
@@ -172,9 +38,10 @@ final class ModelDownloadDelegate: NSObject, URLSessionDownloadDelegate, @unchec
 final class PreferencesWindowController: NSWindowController {
     private let settings: AppSettings
     private let bundle: WhisperBundle
+    private let modelSelectionStore: ModelSelectionStore
     private let onChange: () -> Void
 
-    private var modelOptions: [ModelOption] = []
+    private var selectionSnapshot: ModelSelectionSnapshot?
 
     private let checkbox = NSButton(checkboxWithTitle: "Automatically paste transcript", target: nil, action: nil)
     private let prependSpaceCheckbox = NSButton(checkboxWithTitle: "Add a leading space before the pasted text", target: nil, action: nil)
@@ -186,11 +53,28 @@ final class PreferencesWindowController: NSWindowController {
     private let downloadStatusLabel = NSTextField(labelWithString: "")
     private var downloadDelegate: ModelDownloadDelegate?
     private var activeDownloadTask: URLSessionDownloadTask?
-    private var isDownloading = false
+    private var downloadState: DownloadState = .idle {
+        didSet { applyDownloadState() }
+    }
 
-    init(settings: AppSettings, bundle: WhisperBundle, onChange: @escaping () -> Void) {
+    private enum DownloadState {
+        case idle
+        case inProgress(message: String, progress: Double?)
+        case completed(String)
+        case failed(String)
+
+        var isActive: Bool {
+            if case .inProgress = self { return true }
+            return false
+        }
+    }
+
+    private var isDownloading: Bool { downloadState.isActive }
+
+    init(settings: AppSettings, bundle: WhisperBundle, modelSelectionStore: ModelSelectionStore, onChange: @escaping () -> Void) {
         self.settings = settings
         self.bundle = bundle
+        self.modelSelectionStore = modelSelectionStore
         self.onChange = onChange
 
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 320),
@@ -237,6 +121,7 @@ final class PreferencesWindowController: NSWindowController {
         modelPathField.textColor = .secondaryLabelColor
 
         refreshModelOptions()
+        applyDownloadState()
 
         let behaviorHeader = PreferencesWindowController.makeHeader("Behavior")
         let behaviorDescription = PreferencesWindowController.makeSubtext("When automatic pasting is off, FreeWhisperKey copies the transcript to the clipboard instead.")
@@ -312,14 +197,52 @@ final class PreferencesWindowController: NSWindowController {
         newlineOnBreakCheckbox.alphaValue = settings.autoPasteEnabled ? 1 : 0.6
     }
 
+    private func applyDownloadState() {
+        let hasOptions = selectionSnapshot?.options.isEmpty == false
+        switch downloadState {
+        case .idle:
+            downloadProgress.stopAnimation(nil)
+            downloadProgress.isIndeterminate = true
+            downloadProgress.doubleValue = 0
+            downloadStatusLabel.stringValue = ""
+            modelPopup.isEnabled = hasOptions
+        case let .inProgress(message, progress):
+            downloadStatusLabel.stringValue = message
+            modelPopup.isEnabled = false
+            if let progress {
+                downloadProgress.isIndeterminate = false
+                downloadProgress.doubleValue = progress * 100
+            } else {
+                if !downloadProgress.isIndeterminate {
+                    downloadProgress.isIndeterminate = true
+                }
+                downloadProgress.startAnimation(nil)
+            }
+        case let .completed(message):
+            downloadProgress.stopAnimation(nil)
+            downloadProgress.isIndeterminate = true
+            downloadProgress.doubleValue = 0
+            downloadStatusLabel.stringValue = message
+            modelPopup.isEnabled = hasOptions
+        case let .failed(message):
+            downloadProgress.stopAnimation(nil)
+            downloadProgress.isIndeterminate = true
+            downloadProgress.doubleValue = 0
+            downloadStatusLabel.stringValue = message
+            modelPopup.isEnabled = hasOptions
+        }
+        updateDownloadButtonState()
+    }
+
     private func refreshModelOptions() {
-        modelOptions = buildModelOptions()
+        selectionSnapshot = modelSelectionStore.snapshot(for: bundle)
+        let options = selectionSnapshot?.options ?? []
         modelPopup.removeAllItems()
-        if modelOptions.isEmpty {
+        if options.isEmpty {
             modelPopup.addItem(withTitle: "No bundle models found")
             modelPopup.isEnabled = false
         } else {
-            for option in modelOptions {
+            for option in options {
                 modelPopup.addItem(withTitle: option.menuTitle)
             }
             modelPopup.isEnabled = !isDownloading
@@ -327,92 +250,32 @@ final class PreferencesWindowController: NSWindowController {
         updateModelSelectionUI()
     }
 
-    private func buildModelOptions() -> [ModelOption] {
-        var options: [ModelOption] = []
-        let fm = FileManager.default
-
-        for known in KnownModel.allCases {
-            let fileName = known.fileName
-            let exists = fm.fileExists(atPath: bundle.modelsDirectory.appendingPathComponent(fileName).path)
-            options.append(ModelOption(kind: .known(known), displayName: known.displayName, fileName: fileName, available: exists))
-        }
-
-        let knownNames = Set(options.compactMap { $0.fileName })
-        if let contents = try? fm.contentsOfDirectory(at: bundle.modelsDirectory, includingPropertiesForKeys: nil) {
-            for url in contents where url.pathExtension == "bin" {
-                let fileName = url.lastPathComponent
-                if !knownNames.contains(fileName) {
-                    let title = "\(url.deletingPathExtension().lastPathComponent) (local)"
-                    options.append(ModelOption(kind: .local, displayName: title, fileName: fileName, available: true))
-                }
-            }
-        }
-
-        if settings.customModelPath != nil {
-            options.insert(ModelOption(kind: .custom, displayName: "Custom model", fileName: nil, available: true), at: 0)
-        }
-
-        return options
-    }
-
     private func currentModelOption() -> ModelOption? {
+        guard let snapshot = selectionSnapshot else { return nil }
         let index = modelPopup.indexOfSelectedItem
-        guard index >= 0, index < modelOptions.count else { return nil }
-        return modelOptions[index]
+        guard index >= 0, index < snapshot.options.count else { return nil }
+        return snapshot.options[index]
     }
 
     private func updateModelSelectionUI() {
-        defer {
-            updateModelPathLabel()
-            updateDownloadButtonState()
-        }
+        defer { updateDownloadButtonState() }
 
-        if settings.customModelPath != nil,
-           let index = modelOptions.firstIndex(where: {
-               if case .custom = $0.kind { return true }
-               return false
-           }) {
-            modelPopup.selectItem(at: index)
-            return
-        }
-
-        guard !modelOptions.isEmpty else {
+        guard let snapshot = selectionSnapshot else {
+            modelPopup.selectItem(at: -1)
             modelPathField.stringValue = "Add ggml models to dist/whisper-bundle/models."
             return
         }
 
-        if let selected = settings.selectedModelFilename,
-           let idx = modelOptions.firstIndex(where: { $0.fileName == selected }) {
-            modelPopup.selectItem(at: idx)
-        } else if let idx = modelOptions.firstIndex(where: {
-            if case let .known(known) = $0.kind {
-                return known == .base
-            }
-            return false
-        }) {
-            modelPopup.selectItem(at: idx)
-            settings.selectedModelFilename = modelOptions[idx].fileName
-        } else if let idx = modelOptions.firstIndex(where: { $0.fileName != nil }) {
-            modelPopup.selectItem(at: idx)
-            settings.selectedModelFilename = modelOptions[idx].fileName
-        } else if !modelOptions.isEmpty {
+        if let selectedIndex = snapshot.selectedIndex,
+           selectedIndex < modelPopup.numberOfItems {
+            modelPopup.selectItem(at: selectedIndex)
+        } else if modelPopup.numberOfItems > 0 {
             modelPopup.selectItem(at: 0)
-        }
-    }
-
-    private func updateModelPathLabel() {
-        if let customPath = settings.customModelPath {
-            modelPathField.stringValue = "Custom model: \(customPath)"
-            return
+        } else {
+            modelPopup.selectItem(at: -1)
         }
 
-        if let selected = settings.selectedModelFilename {
-            let path = bundle.modelsDirectory.appendingPathComponent(selected).path
-            modelPathField.stringValue = "Bundle path: \(path)"
-            return
-        }
-
-        modelPathField.stringValue = "Bundle path: \(bundle.defaultModel.path)"
+        modelPathField.stringValue = snapshot.pathDescription
     }
 
     private func updateDownloadButtonState() {
@@ -420,10 +283,6 @@ final class PreferencesWindowController: NSWindowController {
             downloadButton.isEnabled = option.needsDownload && !isDownloading
         } else {
             downloadButton.isEnabled = false
-        }
-        if !isDownloading {
-            downloadProgress.stopAnimation(nil)
-            downloadStatusLabel.stringValue = ""
         }
     }
 
@@ -436,11 +295,10 @@ final class PreferencesWindowController: NSWindowController {
             startDownload(for: known, successSelection: option)
             return
         default:
-            settings.customModelPath = nil
-            settings.selectedModelFilename = option.fileName
+            modelSelectionStore.applySelection(option)
             onChange()
         }
-        updateModelSelectionUI()
+        refreshModelOptions()
     }
 
     @objc private func chooseModel() {
@@ -453,18 +311,14 @@ final class PreferencesWindowController: NSWindowController {
         panel.allowsMultipleSelection = false
         panel.title = "Select Whisper Model (.bin)"
         if panel.runModal() == .OK, let url = panel.url {
-            settings.customModelPath = url.path
-            settings.selectedModelFilename = nil
+            modelSelectionStore.useCustomModel(at: url.path)
             refreshModelOptions()
             onChange()
         }
     }
 
     @objc private func resetModel() {
-        settings.customModelPath = nil
-        if settings.selectedModelFilename == nil {
-            settings.selectedModelFilename = bundle.defaultModel.lastPathComponent
-        }
+        modelSelectionStore.resetCustomModelIfNeeded(defaultModelName: bundle.defaultModel.lastPathComponent)
         refreshModelOptions()
         onChange()
     }
@@ -477,13 +331,7 @@ final class PreferencesWindowController: NSWindowController {
 
     private func startDownload(for known: KnownModel, successSelection: ModelOption) {
         guard !isDownloading else { return }
-        isDownloading = true
-        modelPopup.isEnabled = false
-        downloadButton.isEnabled = false
-        downloadProgress.doubleValue = 0
-        downloadProgress.isIndeterminate = true
-        downloadProgress.startAnimation(nil)
-        downloadStatusLabel.stringValue = "Downloading \(known.displayName)…"
+        downloadState = .inProgress(message: "Downloading \(known.displayName)…", progress: nil)
 
         let destination = bundle.modelsDirectory.appendingPathComponent(known.fileName)
         let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("whisper-model-\(UUID().uuidString).bin")
@@ -495,33 +343,25 @@ final class PreferencesWindowController: NSWindowController {
         delegate.progressHandler = { [weak self] fraction in
             guard let self else { return }
             DispatchQueue.main.async {
-                if fraction > 0 {
-                    self.downloadProgress.isIndeterminate = false
-                    self.downloadProgress.doubleValue = fraction * 100
-                } else if !self.downloadProgress.isIndeterminate {
-                    self.downloadProgress.isIndeterminate = true
-                    self.downloadProgress.startAnimation(nil)
-                }
+                let progress = fraction > 0 ? fraction : nil
+                self.downloadState = .inProgress(message: "Downloading \(known.displayName)…", progress: progress)
             }
         }
 
         delegate.completionHandler = { [weak self] result in
             guard let self else { return }
-            DispatchQueue.main.async {
-                self.downloadProgress.stopAnimation(nil)
-                self.isDownloading = false
+            let fail: (String) -> Void = { message in
+                DispatchQueue.main.async {
+                    self.downloadState = .failed("Download failed: \(message)")
+                    self.showError("Download failed: \(message)")
+                    self.downloadDelegate = nil
+                    self.activeDownloadTask = nil
+                }
             }
 
             switch result {
             case .failure(let error):
-                DispatchQueue.main.async {
-                    self.modelPopup.isEnabled = true
-                    self.downloadStatusLabel.stringValue = ""
-                    self.showError("Download failed: \(error.localizedDescription)")
-                    self.downloadDelegate = nil
-                    self.activeDownloadTask = nil
-                    self.updateDownloadButtonState()
-                }
+                fail(error.localizedDescription)
             case .success(let tempLocation):
                 do {
                     let fm = FileManager.default
@@ -535,24 +375,15 @@ final class PreferencesWindowController: NSWindowController {
                     try fm.copyItem(at: tempURL, to: destination)
                     try fm.removeItem(at: tempURL)
                 } catch {
-                    DispatchQueue.main.async {
-                        self.modelPopup.isEnabled = true
-                        self.downloadStatusLabel.stringValue = ""
-                        self.showError("Download failed: \(error.localizedDescription)")
-                        self.downloadDelegate = nil
-                        self.activeDownloadTask = nil
-                        self.updateDownloadButtonState()
-                    }
+                    fail(error.localizedDescription)
                     return
                 }
 
                 DispatchQueue.main.async {
-                    self.downloadStatusLabel.stringValue = "Installed \(known.displayName)."
-                    self.modelPopup.isEnabled = true
+                    self.modelSelectionStore.applySelection(successSelection)
+                    self.downloadState = .completed("Installed \(known.displayName).")
                     self.downloadDelegate = nil
                     self.activeDownloadTask = nil
-                    self.settings.customModelPath = nil
-                    self.settings.selectedModelFilename = successSelection.fileName
                     self.refreshModelOptions()
                     self.onChange()
                 }
@@ -608,10 +439,7 @@ final class DictationShortcutAdvisor {
 
         let alert = NSAlert()
         alert.messageText = "Fn key is still reserved for Dictation"
-        alert.informativeText = """
-macOS currently launches Dictation when you press Fn, which causes the “processing your voice” popup.
-Disable or reassign the Dictation shortcut (Keyboard → Dictation → Shortcut) so FreeWhisperKey can use Fn uninterrupted.
-"""
+        alert.informativeText = "macOS currently launches Dictation when you press Fn, which causes the “processing your voice” popup.\nDisable or reassign the Dictation shortcut (Keyboard → Dictation → Shortcut) so FreeWhisperKey can use Fn uninterrupted."
         alert.addButton(withTitle: "Open Keyboard Settings")
         alert.addButton(withTitle: "Not Now")
         let response = alert.runModal()
@@ -1092,11 +920,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let pasteController = PasteController()
     private let dictationAdvisor = DictationShortcutAdvisor()
     private let settings = AppSettings()
+    private lazy var modelSelectionStore = ModelSelectionStore(settings: settings)
+    private let transcriptDelivery = TranscriptDelivery()
     private var preferencesWindowController: PreferencesWindowController?
     private var state: CaptureState = .idle
-    private var lastTranscript: String?
-    private var lastPasteDate: Date?
-    private let pasteBreakInterval: TimeInterval = 6
     private var copyLastTranscriptItem: NSMenuItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -1167,9 +994,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func configureBridge() throws {
         let bundle = try WhisperBundleResolver.resolve()
         whisperBundle = bundle
-        if settings.selectedModelFilename == nil && settings.customModelPath == nil {
-            settings.selectedModelFilename = bundle.defaultModel.lastPathComponent
-        }
         whisperBridge = try buildBridge(using: bundle)
     }
 
@@ -1185,23 +1009,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             bundle = resolved
         }
 
-        let modelURL: URL
-        if let customPath = settings.customModelPath {
-            let customURL = URL(fileURLWithPath: customPath)
-            guard FileManager.default.fileExists(atPath: customURL.path) else {
-                throw TranscriptionError.bundleMissing("Custom model not found at \(customURL.path).")
-            }
-            modelURL = customURL
-        } else if let fileName = settings.selectedModelFilename {
-            let candidate = bundle.modelsDirectory.appendingPathComponent(fileName)
-            guard FileManager.default.fileExists(atPath: candidate.path) else {
-                throw TranscriptionError.bundleMissing("Model not found at \(candidate.path).")
-            }
-            modelURL = candidate
-        } else {
-            modelURL = bundle.defaultModel
-        }
-
+        let modelURL = try modelSelectionStore.resolveModelURL(in: bundle)
         return WhisperBridge(executableURL: bundle.binary, modelURL: modelURL)
     }
 
@@ -1210,9 +1018,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             whisperBridge = try buildBridge()
         } catch {
             presentAlert(message: "Model Error", informativeText: error.localizedDescription)
-            settings.customModelPath = nil
             if let defaultName = whisperBundle?.defaultModel.lastPathComponent {
-                settings.selectedModelFilename = defaultName
+                modelSelectionStore.resetCustomModelIfNeeded(defaultModelName: defaultName)
             }
             whisperBridge = try? buildBridge()
         }
@@ -1236,7 +1043,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if preferencesWindowController == nil {
             preferencesWindowController = PreferencesWindowController(
                 settings: settings,
-                bundle: bundle
+                bundle: bundle,
+                modelSelectionStore: modelSelectionStore
             ) { [weak self] in
                 self?.reloadBridge()
             }
@@ -1297,22 +1105,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func presentTranscript(_ text: String) {
         resetState()
-        let normalizedText = normalizedTranscript(text)
-        let trimmed = normalizedText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed != "[BLANK_AUDIO]" else { return }
-        lastTranscript = normalizedText
+        guard let result = transcriptDelivery.processTranscript(text, configuration: settings.deliveryConfiguration) else {
+            return
+        }
         updateCopyTranscriptMenuState()
-        if settings.autoPasteEnabled {
-            let outgoingText = preparedTranscriptForPasting(original: normalizedText, trimmed: trimmed)
+        switch result.action {
+        case .paste(let outgoingText):
             do {
                 try pasteController.paste(text: outgoingText)
-                lastPasteDate = Date()
+                transcriptDelivery.markPasteCompleted()
             } catch {
                 presentAlert(message: "Paste Error", informativeText: error.localizedDescription)
             }
-        } else {
-            copyToClipboard(normalizedText)
-            presentAlert(message: "Transcription Complete", informativeText: "Transcript copied to clipboard:\n\n\(normalizedText)")
+        case .copy(let text):
+            copyToClipboard(text)
+            presentAlert(message: "Transcription Complete", informativeText: "Transcript copied to clipboard:\n\n\(text)")
         }
     }
 
@@ -1339,58 +1146,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pasteboard.setString(text, forType: .string)
     }
 
-    private func normalizedTranscript(_ text: String) -> String {
-        guard !settings.insertNewlineOnBreak else { return text }
-        let newlineSet = CharacterSet.newlines
-        let segments = text.components(separatedBy: newlineSet)
-        let joined = segments.joined(separator: " ")
-        return joined.replacingOccurrences(of: #" {2,}"#, with: " ", options: .regularExpression)
-    }
-
-    private func preparedTranscriptForPasting(original: String, trimmed: String) -> String {
-        guard !original.isEmpty else { return original }
-        var prefix = ""
-        if settings.insertNewlineOnBreak,
-           shouldInsertBreakBeforePaste(),
-           !trimmed.isEmpty,
-           !original.hasPrefix("\n") {
-            prefix.append("\n")
-        }
-        if settings.prependSpaceBeforePaste,
-           !trimmed.isEmpty,
-           !startsWithLeadingWhitespace(original) {
-            prefix.append(" ")
-        }
-        return prefix.isEmpty ? original : prefix + original
-    }
-
-    private func shouldInsertBreakBeforePaste() -> Bool {
-        guard let lastPasteDate else { return false }
-        return Date().timeIntervalSince(lastPasteDate) >= pasteBreakInterval
-    }
-
-    private func startsWithLeadingWhitespace(_ text: String) -> Bool {
-        guard let firstScalar = text.unicodeScalars.first else { return false }
-        return CharacterSet.whitespacesAndNewlines.contains(firstScalar)
-    }
-
     @objc private func copyLastTranscript() {
-        guard let lastTranscript else { return }
-        copyToClipboard(lastTranscript)
+        guard let transcript = transcriptDelivery.lastTranscript else { return }
+        copyToClipboard(transcript)
     }
 
     private func updateCopyTranscriptMenuState() {
-        copyLastTranscriptItem?.isEnabled = (lastTranscript != nil)
+        copyLastTranscriptItem?.isEnabled = (transcriptDelivery.lastTranscript != nil)
     }
 }
 
-@main
-struct TranscribeMenuAppMain {
-    static func main() {
-        let app = NSApplication.shared
-        let delegate = AppDelegate()
-        app.delegate = delegate
-        app.setActivationPolicy(.accessory)
-        app.run()
-    }
-}

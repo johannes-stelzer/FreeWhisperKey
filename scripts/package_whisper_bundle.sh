@@ -24,6 +24,8 @@ mkdir -p "$DEST/bin" "$DEST/models"
 
 cp "$BIN_SRC" "$DEST/bin/"
 cp "$MODEL_SRC" "$DEST/models/"
+cp "$ROOT_DIR/LICENSE" "$DEST/"
+cp "$ROOT_DIR/THIRD_PARTY_NOTICES.md" "$DEST/"
 
 cat >"$DEST/README.txt" <<'EOF'
 whisper-bundle
@@ -39,7 +41,10 @@ Usage example (run from repo root):
       -m dist/whisper-bundle/models/ggml-base.bin \
       -f whisper.cpp/samples/jfk.wav -otxt -of /tmp/jfk_bundle
 
-Ensure you comply with the upstream project licenses when redistributing.
+Licensing:
+  - LICENSE (BSD 3-Clause) applies to the helper glue in this repository.
+  - THIRD_PARTY_NOTICES.md reproduces the MIT licenses for whisper.cpp and OpenAI's Whisper models.
+Ensure you ship both files with any redistribution.
 EOF
 
 echo "Bundle created at $DEST"
