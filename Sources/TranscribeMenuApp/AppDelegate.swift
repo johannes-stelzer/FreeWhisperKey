@@ -18,7 +18,6 @@ final class PreferencesWindowController: NSWindowController {
     private let newlineOnBreakCheckbox = NSButton(checkboxWithTitle: "Start on a new line after a long pause", target: nil, action: nil)
     private let modelPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let modelPathField = NSTextField(labelWithString: "")
-    private let downloadButton = NSButton(title: "Download Selected Model", target: nil, action: nil)
     private let downloadProgress = NSProgressIndicator()
     private let downloadStatusLabel = NSTextField(labelWithString: "")
     private var downloadDelegate: ModelDownloadDelegate?
@@ -70,9 +69,6 @@ final class PreferencesWindowController: NSWindowController {
         modelPopup.target = self
         modelPopup.action = #selector(modelSelectionChanged)
 
-        downloadButton.target = self
-        downloadButton.action = #selector(downloadSelectedModel)
-
         downloadProgress.style = .bar
         downloadProgress.controlSize = .small
         downloadProgress.isIndeterminate = true
@@ -99,10 +95,7 @@ final class PreferencesWindowController: NSWindowController {
         let modelHeader = PreferencesWindowController.makeHeader("Model")
         let modelDescription = PreferencesWindowController.makeSubtext("Select a bundled ggml model. Missing models can be downloaded automatically.")
 
-        let downloadButtonRow = NSStackView(views: [downloadButton, downloadProgress])
-        downloadButtonRow.spacing = 8
-
-        let downloadStack = NSStackView(views: [downloadButtonRow, downloadStatusLabel])
+        let downloadStack = NSStackView(views: [downloadProgress, downloadStatusLabel])
         downloadStack.orientation = .vertical
         downloadStack.spacing = 4
 
@@ -194,7 +187,6 @@ final class PreferencesWindowController: NSWindowController {
             downloadStatusLabel.stringValue = message
             modelPopup.isEnabled = hasOptions
         }
-        updateDownloadButtonState()
     }
 
     private func refreshModelOptions() {
@@ -224,7 +216,6 @@ final class PreferencesWindowController: NSWindowController {
         guard let snapshot = selectionSnapshot else {
             modelPopup.selectItem(at: -1)
             modelPathField.stringValue = "Add ggml models to dist/whisper-bundle/models."
-            updateDownloadButtonState()
             return
         }
 
@@ -238,15 +229,6 @@ final class PreferencesWindowController: NSWindowController {
         }
 
         modelPathField.stringValue = snapshot.pathDescription
-        updateDownloadButtonState()
-    }
-
-    private func updateDownloadButtonState() {
-        if let option = currentModelOption() {
-            downloadButton.isEnabled = option.needsDownload && !isDownloading
-        } else {
-            downloadButton.isEnabled = false
-        }
     }
 
     @objc private func modelSelectionChanged() {
@@ -260,12 +242,6 @@ final class PreferencesWindowController: NSWindowController {
             refreshModelOptions()
             onChange()
         }
-    }
-
-    @objc private func downloadSelectedModel() {
-        guard let option = currentModelOption(),
-              case let .known(known) = option.kind else { return }
-        startDownload(for: known, successSelection: option)
     }
 
     private func verifyDownload(at url: URL, for model: KnownModel) throws {

@@ -225,10 +225,9 @@ final class ModelSelectionStore {
 
     private func pathDescription(bundle: WhisperBundle) -> String {
         if let fileName = settings.selectedModelFilename {
-            let path = bundle.modelsDirectory.appendingPathComponent(fileName).path
-            return "Bundle path: \(path)"
+            return "Selected model: \(fileName)"
         }
 
-        return "Bundle path: \(bundle.defaultModel.path)"
+        return "Selected model: \(bundle.defaultModel.lastPathComponent)"
     }
 }
