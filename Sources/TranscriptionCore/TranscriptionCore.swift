@@ -184,14 +184,42 @@ public struct WhisperBridge: Sendable {
 
         let stderrPipe = Pipe()
         process.standardError = stderrPipe
+        let stderrHandle = stderrPipe.fileHandleForReading
+        let stderrGroup = DispatchGroup()
+        var didStartStderrCapture = false
+        final class StderrCaptureBox: @unchecked Sendable {
+            var data = Data()
+        }
+        let stderrBox = StderrCaptureBox()
+
+        func startStderrCapture() {
+            guard !didStartStderrCapture else { return }
+            didStartStderrCapture = true
+            stderrGroup.enter()
+            DispatchQueue.global(qos: .utility).async {
+                defer { stderrGroup.leave() }
+                do {
+                    stderrBox.data = try stderrHandle.readToEnd() ?? Data()
+                } catch {
+                    stderrBox.data = Data()
+                }
+            }
+        }
+
+        func finishStderrCapture() {
+            guard didStartStderrCapture else { return }
+            try? stderrHandle.close()
+            stderrGroup.wait()
+        }
 
         do {
             try process.run()
+            startStderrCapture()
             process.waitUntilExit()
+            finishStderrCapture()
 
             if process.terminationStatus != 0 {
-                let data = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-                let message = String(data: data, encoding: .utf8) ?? "unknown error"
+                let message = String(data: stderrBox.data, encoding: .utf8) ?? "unknown error"
                 throw TranscriptionError.whisperFailed(message.trimmingCharacters(in: .whitespacesAndNewlines))
             }
 
