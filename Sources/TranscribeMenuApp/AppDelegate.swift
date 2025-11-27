@@ -248,7 +248,6 @@ final class PreferencesWindowController: NSWindowController {
         downloadState = .inProgress(message: "Downloading \(known.displayName)…", progress: nil)
 
         let destination = bundle.modelsDirectory.appendingPathComponent(known.fileName)
-        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("whisper-model-\(UUID().uuidString).bin")
 
         let delegate = ModelDownloadDelegate()
         delegate.expectedBytes = known.expectedBytes
@@ -279,16 +278,24 @@ final class PreferencesWindowController: NSWindowController {
             case .success(let tempLocation):
                 do {
                     let fm = FileManager.default
-                    defer { try? fm.removeItem(at: tempURL) }
-                    if fm.fileExists(atPath: tempURL.path) {
-                        try fm.removeItem(at: tempURL)
+                    defer { try? fm.removeItem(at: tempLocation) }
+
+                    let stagingFileName = ".tmp-\(UUID().uuidString)-\(known.fileName)"
+                    let stagingURL = destination.deletingLastPathComponent().appendingPathComponent(stagingFileName)
+                    defer { try? fm.removeItem(at: stagingURL) }
+
+                    if fm.fileExists(atPath: stagingURL.path) {
+                        try fm.removeItem(at: stagingURL)
                     }
-                    try fm.moveItem(at: tempLocation, to: tempURL)
-                    try ModelVerifier.verify(downloadedFile: tempURL, for: known, fileManager: fm)
+
+                    try fm.moveItem(at: tempLocation, to: stagingURL)
+                    try ModelVerifier.verify(downloadedFile: stagingURL, for: known, fileManager: fm)
+
                     if fm.fileExists(atPath: destination.path) {
-                        try fm.removeItem(at: destination)
+                        _ = try fm.replaceItemAt(destination, withItemAt: stagingURL, backupItemName: nil, options: [])
+                    } else {
+                        try fm.moveItem(at: stagingURL, to: destination)
                     }
-                    try fm.copyItem(at: tempURL, to: destination)
                 } catch {
                     fail(error.localizedDescription)
                     return
