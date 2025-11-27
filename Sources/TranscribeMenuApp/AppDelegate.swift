@@ -8,10 +8,12 @@ final class PreferencesWindowController: NSWindowController {
     private let settings: AppSettings
     private let bundle: WhisperBundle
     private let modelSelectionStore: ModelSelectionStore
+    private let loginItemController: LaunchAtLoginController
     private let onChange: () -> Void
 
     private var selectionSnapshot: ModelSelectionSnapshot?
 
+    private let launchAtLoginCheckbox = NSButton(checkboxWithTitle: "Launch FreeWhisperKey at login", target: nil, action: nil)
     private let checkbox = NSButton(checkboxWithTitle: "Automatically paste transcript", target: nil, action: nil)
     private let prependSpaceCheckbox = NSButton(checkboxWithTitle: "Add a leading space before the pasted text", target: nil, action: nil)
     private let newlineOnBreakCheckbox = NSButton(checkboxWithTitle: "Start on a new line after a long pause", target: nil, action: nil)
@@ -40,10 +42,17 @@ final class PreferencesWindowController: NSWindowController {
     private var isDownloading: Bool { downloadState.isActive }
     var isDownloadingModel: Bool { downloadState.isActive }
 
-    init(settings: AppSettings, bundle: WhisperBundle, modelSelectionStore: ModelSelectionStore, onChange: @escaping () -> Void) {
+    init(
+        settings: AppSettings,
+        bundle: WhisperBundle,
+        modelSelectionStore: ModelSelectionStore,
+        loginItemController: LaunchAtLoginController,
+        onChange: @escaping () -> Void
+    ) {
         self.settings = settings
         self.bundle = bundle
         self.modelSelectionStore = modelSelectionStore
+        self.loginItemController = loginItemController
         self.onChange = onChange
 
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 320),
@@ -53,6 +62,10 @@ final class PreferencesWindowController: NSWindowController {
         window.title = "Preferences"
         window.center()
         super.init(window: window)
+
+        launchAtLoginCheckbox.target = self
+        launchAtLoginCheckbox.action = #selector(toggleLaunchAtLogin)
+        launchAtLoginCheckbox.state = settings.launchAtLoginEnabled ? .on : .off
 
         checkbox.target = self
         checkbox.action = #selector(toggleAutoPaste)
@@ -110,6 +123,7 @@ final class PreferencesWindowController: NSWindowController {
 
         let stack = NSStackView(views: [
             behaviorHeader,
+            launchAtLoginCheckbox,
             checkbox,
             behaviorDescription,
             prependSpaceCheckbox,
@@ -128,6 +142,17 @@ final class PreferencesWindowController: NSWindowController {
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    @objc private func toggleLaunchAtLogin() {
+        let enabled = (launchAtLoginCheckbox.state == .on)
+        do {
+            try loginItemController.setEnabled(enabled)
+            settings.launchAtLoginEnabled = enabled
+        } catch {
+            launchAtLoginCheckbox.state = settings.launchAtLoginEnabled ? .on : .off
+            showPreferencesAlert(title: "Login Item Error", message: error.localizedDescription)
+        }
     }
 
     @objc private func toggleAutoPaste() {
@@ -341,6 +366,13 @@ final class PreferencesWindowController: NSWindowController {
     private func showError(_ message: String) {
         let alert = NSAlert()
         alert.messageText = "Model Download"
+        alert.informativeText = message
+        alert.runModal()
+    }
+
+    private func showPreferencesAlert(title: String, message: String) {
+        let alert = NSAlert()
+        alert.messageText = title
         alert.informativeText = message
         alert.runModal()
     }
@@ -908,6 +940,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let pasteController = PasteController()
     private let dictationAdvisor = DictationShortcutAdvisor()
     private let settings = AppSettings()
+    private let launchAtLoginController = LaunchAtLoginController()
     private lazy var modelSelectionStore = ModelSelectionStore(settings: settings)
     private let transcriptDelivery = TranscriptDelivery()
     private var preferencesWindowController: PreferencesWindowController?
@@ -921,6 +954,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         do {
             try configureBridge()
             configureHotkey()
+            applyLaunchAtLoginPreference()
             dictationAdvisor.promptIfNeeded()
             AccessibilityPermissionAdvisor.requestSystemPromptIfNeeded()
             recorder.levelUpdateHandler = { [weak self] level in
@@ -1061,7 +1095,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             preferencesWindowController = PreferencesWindowController(
                 settings: settings,
                 bundle: bundle,
-                modelSelectionStore: modelSelectionStore
+                modelSelectionStore: modelSelectionStore,
+                loginItemController: launchAtLoginController
             ) { [weak self] in
                 self?.reloadBridge()
             }
@@ -1250,6 +1285,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateCopyTranscriptMenuState() {
         copyLastTranscriptItem?.isEnabled = (transcriptDelivery.lastTranscript != nil)
+    }
+
+    private func applyLaunchAtLoginPreference() {
+        do {
+            try launchAtLoginController.setEnabled(settings.launchAtLoginEnabled)
+        } catch {
+            settings.launchAtLoginEnabled = false
+            presentAlert(message: "Login Item Error", informativeText: error.localizedDescription)
+        }
     }
 }
 enum ModelVerificationError: LocalizedError {

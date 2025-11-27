@@ -7,6 +7,7 @@ final class AppSettings {
         case selectedModelFilename
         case prependSpaceBeforePaste
         case insertNewlineOnBreak
+        case launchAtLoginEnabled
     }
 
     private let defaults: UserDefaults
@@ -15,7 +16,8 @@ final class AppSettings {
         self.defaults = defaults
         defaults.register(defaults: [
             Keys.autoPasteEnabled.rawValue: true,
-            Keys.prependSpaceBeforePaste.rawValue: true
+            Keys.prependSpaceBeforePaste.rawValue: true,
+            Keys.launchAtLoginEnabled.rawValue: false
         ])
     }
 
@@ -37,6 +39,11 @@ final class AppSettings {
     var insertNewlineOnBreak: Bool {
         get { bool(for: .insertNewlineOnBreak) }
         set { set(newValue, for: .insertNewlineOnBreak) }
+    }
+
+    var launchAtLoginEnabled: Bool {
+        get { bool(for: .launchAtLoginEnabled) }
+        set { set(newValue, for: .launchAtLoginEnabled) }
     }
 
     // MARK: - Helpers
