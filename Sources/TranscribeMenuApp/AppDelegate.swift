@@ -845,6 +845,7 @@ final class StatusIconView: NSView {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private enum CaptureState {
         case idle
+        case starting(TemporaryRecording)
         case recording(TemporaryRecording)
         case processing
     }
@@ -863,6 +864,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let transcriptDelivery = TranscriptDelivery()
     private var preferencesWindowController: PreferencesWindowController?
     private var state: CaptureState = .idle
+    private var pendingStopAfterStart = false
     private var copyLastTranscriptItem: NSMenuItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -1011,24 +1013,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        do {
-            try recorder.beginRecording(into: recording.url)
-            state = .recording(recording)
-            statusIconView.state = .recording
-        } catch {
-            cleanupRecording(recording, context: "failed to start recording")
-            state = .idle
-            statusIconView.state = .idle
-            presentAlert(message: "Recording Error", informativeText: error.localizedDescription)
+        state = .starting(recording)
+        statusIconView.state = .processing
+        pendingStopAfterStart = false
+
+        workQueue.async { [weak self] in
+            guard let strongSelf = self else { return }
+            do {
+                try strongSelf.recorder.beginRecording(into: recording.url)
+                DispatchQueue.main.async {
+                    guard case .starting(let activeRecording) = strongSelf.state else {
+                        return
+                    }
+                    strongSelf.state = .recording(activeRecording)
+                    strongSelf.statusIconView.state = .recording
+                    if strongSelf.pendingStopAfterStart {
+                        strongSelf.pendingStopAfterStart = false
+                        strongSelf.finishPressToTalk()
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    guard let holder = self else { return }
+                    holder.pendingStopAfterStart = false
+                    holder.cleanupRecording(recording, context: "failed to start recording")
+                    holder.state = .idle
+                    holder.statusIconView.state = .idle
+                    holder.presentAlert(message: "Recording Error", informativeText: error.localizedDescription)
+                }
+            }
         }
     }
 
     private func finishPressToTalk() {
-        guard case .recording(let recording) = state else { return }
-        recorder.stopRecording()
-        state = .processing
-        statusIconView.state = .processing
-        transcribeRecording(recording)
+        switch state {
+        case .starting:
+            pendingStopAfterStart = true
+            return
+        case .recording(let recording):
+            pendingStopAfterStart = false
+            recorder.stopRecording()
+            state = .processing
+            statusIconView.state = .processing
+            transcribeRecording(recording)
+        default:
+            return
+        }
     }
 
     private func transcribeRecording(_ recording: TemporaryRecording) {
@@ -1096,6 +1126,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func resetState() {
         state = .idle
+        pendingStopAfterStart = false
         statusIconView.state = .idle
     }
 

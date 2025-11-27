@@ -224,7 +224,12 @@ public struct WhisperBridge: Sendable {
             }
 
             let transcriptURL = tempBase.appendingPathExtension("txt")
-            let text = try String(contentsOf: transcriptURL, encoding: .utf8)
+            let text: String
+            if fileManager.fileExists(atPath: transcriptURL.path) {
+                text = try String(contentsOf: transcriptURL, encoding: .utf8)
+            } else {
+                text = "[BLANK_AUDIO]"
+            }
             do {
                 try Self.securelyRemoveScratchDirectory(at: scratchDirectory, fileManager: fileManager)
             } catch {
